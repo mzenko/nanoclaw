@@ -165,7 +165,10 @@ vi.mock('discord.js', () => {
   // Captures the path/name pair the SUT passed so tests can assert on the
   // exact files included in a sendAttachment call.
   class AttachmentBuilder {
-    constructor(public attachment: string, public opts?: { name?: string }) {}
+    constructor(
+      public attachment: string,
+      public opts?: { name?: string },
+    ) {}
   }
 
   return {
@@ -785,7 +788,10 @@ describe('DiscordChannel', () => {
 
   describe('sendAttachment', () => {
     // Ensure a real file exists for fs.statSync inside sendAttachment.
-    const tmpFile = path.join(os.tmpdir(), `nanoclaw-attach-${process.pid}.txt`);
+    const tmpFile = path.join(
+      os.tmpdir(),
+      `nanoclaw-attach-${process.pid}.txt`,
+    );
     const bigTmpFile = path.join(
       os.tmpdir(),
       `nanoclaw-attach-big-${process.pid}.bin`,
@@ -818,11 +824,9 @@ describe('DiscordChannel', () => {
       };
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
-      await channel.sendAttachment(
-        'dc:1234567890123456',
-        'here you go',
-        [{ hostPath: tmpFile, name: 'note.txt' }],
-      );
+      await channel.sendAttachment('dc:1234567890123456', 'here you go', [
+        { hostPath: tmpFile, name: 'note.txt' },
+      ]);
 
       expect(mockChannel.send).toHaveBeenCalledTimes(1);
       const payload = mockChannel.send.mock.calls[0][0];
@@ -846,11 +850,9 @@ describe('DiscordChannel', () => {
       };
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
-      await channel.sendAttachment(
-        'dc:1234567890123456',
-        'caption',
-        [{ hostPath: bigTmpFile, name: 'big.bin' }],
-      );
+      await channel.sendAttachment('dc:1234567890123456', 'caption', [
+        { hostPath: bigTmpFile, name: 'big.bin' },
+      ]);
 
       expect(mockChannel.send).toHaveBeenCalledTimes(1);
       const payload = mockChannel.send.mock.calls[0][0];
@@ -867,11 +869,9 @@ describe('DiscordChannel', () => {
       };
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
-      await channel.sendAttachment(
-        'dc:1234567890123456',
-        'caption',
-        [{ hostPath: '/nonexistent/path.png', name: 'ghost.png' }],
-      );
+      await channel.sendAttachment('dc:1234567890123456', 'caption', [
+        { hostPath: '/nonexistent/path.png', name: 'ghost.png' },
+      ]);
 
       expect(mockChannel.send).toHaveBeenCalledTimes(1);
       const payload = mockChannel.send.mock.calls[0][0];
@@ -887,11 +887,7 @@ describe('DiscordChannel', () => {
       };
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
-      await channel.sendAttachment(
-        'dc:1234567890123456',
-        'just text',
-        [],
-      );
+      await channel.sendAttachment('dc:1234567890123456', 'just text', []);
 
       expect(mockChannel.send).toHaveBeenCalledTimes(1);
       const payload = mockChannel.send.mock.calls[0][0];
@@ -909,11 +905,9 @@ describe('DiscordChannel', () => {
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
       const longText = 'x'.repeat(3000);
-      await channel.sendAttachment(
-        'dc:1234567890123456',
-        longText,
-        [{ hostPath: tmpFile, name: 'note.txt' }],
-      );
+      await channel.sendAttachment('dc:1234567890123456', longText, [
+        { hostPath: tmpFile, name: 'note.txt' },
+      ]);
 
       expect(mockChannel.send).toHaveBeenCalledTimes(2);
       // First call carries the file, second is text-only
@@ -1080,7 +1074,8 @@ describe('DiscordChannel', () => {
       const msg = state.sent[0];
       // edit was called at least once
       expect(msg.edit).toHaveBeenCalled();
-      const lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      const lastPayload =
+        msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
       const parentEmbed = lastPayload.embeds[0];
       const activity = parentEmbed.data.fields?.find(
         (f: any) => f.name === 'Activity',
@@ -1142,7 +1137,8 @@ describe('DiscordChannel', () => {
 
       const state = currentClient().channelState['1234567890123456'];
       const msg = state.sent[0];
-      const lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      const lastPayload =
+        msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
       // 1 parent + 9 subagents = 10 embeds
       expect(lastPayload.embeds.length).toBe(10);
       // Oldest (`agent-0`) should have been evicted; newest (`agent-9`) kept.
@@ -1195,7 +1191,8 @@ describe('DiscordChannel', () => {
       // Should NOT have been deleted
       expect(msg.delete).not.toHaveBeenCalled();
       // Last edit should be the failure breadcrumb
-      const lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      const lastPayload =
+        msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
       const parent = lastPayload.embeds[0];
       expect(parent.data.title).toBe('Failed');
       expect(parent.data.color).toBe(0xed4245); // COLOR_FAILED
@@ -1214,7 +1211,8 @@ describe('DiscordChannel', () => {
       const state = currentClient().channelState['1234567890123456'];
       const msg = state.sent[0];
       expect(msg.delete).not.toHaveBeenCalled();
-      const lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      const lastPayload =
+        msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
       const parent = lastPayload.embeds[0];
       expect(parent.data.title).toBe('Cancelled');
       expect(parent.data.color).toBe(0x95a5a6); // COLOR_INTERRUPTED

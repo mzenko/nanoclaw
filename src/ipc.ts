@@ -105,11 +105,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     files.push({ hostPath, name: path.basename(hostPath) });
                   }
                   if (files.length > 0 && deps.sendAttachment) {
-                    await deps.sendAttachment(
-                      data.chatJid,
-                      data.text,
-                      files,
-                    );
+                    await deps.sendAttachment(data.chatJid, data.text, files);
                   } else {
                     if (files.length > 0) {
                       logger.warn(

@@ -312,8 +312,7 @@ async function buildContainerArgs(
   // Every MCP-server sidecar reachable on the nanoclaw bridge needs to be
   // listed here so Node's fetch doesn't route plain-HTTP intra-network calls
   // through the OneCLI proxy (which expects to MITM HTTPS).
-  const noProxy =
-    'workspace-mcp,playwright-mcp,ha-mcp,localhost,127.0.0.1';
+  const noProxy = 'workspace-mcp,playwright-mcp,ha-mcp,localhost,127.0.0.1';
   args.push('-e', `NO_PROXY=${noProxy}`);
   args.push('-e', `no_proxy=${noProxy}`);
 
@@ -472,8 +471,9 @@ export async function runContainerAgent(
             progStart >= 0
               ? { kind: 'progress' as const, start: progStart }
               : null,
-          ].filter((c): c is { kind: 'output' | 'progress'; start: number } =>
-            c !== null,
+          ].filter(
+            (c): c is { kind: 'output' | 'progress'; start: number } =>
+              c !== null,
           );
           if (candidates.length === 0) break;
           candidates.sort((a, b) => a.start - b.start);
@@ -485,9 +485,7 @@ export async function runContainerAgent(
             const jsonStr = parseBuffer
               .slice(next.start + markers.outputStart.length, endIdx)
               .trim();
-            parseBuffer = parseBuffer.slice(
-              endIdx + markers.outputEnd.length,
-            );
+            parseBuffer = parseBuffer.slice(endIdx + markers.outputEnd.length);
             try {
               const parsed: ContainerOutput = JSON.parse(jsonStr);
               if (parsed.newSessionId) {

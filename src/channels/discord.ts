@@ -141,8 +141,10 @@ export class DiscordChannel implements Channel {
 
     this.client.on(
       Events.MessageReactionAdd,
-      (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) =>
-        this.handleReaction(reaction, user),
+      (
+        reaction: MessageReaction | PartialMessageReaction,
+        user: User | PartialUser,
+      ) => this.handleReaction(reaction, user),
     );
 
     this.client.on(Events.MessageCreate, async (message: Message) => {
@@ -378,9 +380,7 @@ export class DiscordChannel implements Channel {
             );
             continue;
           }
-          builders.push(
-            new AttachmentBuilder(f.hostPath, { name: f.name }),
-          );
+          builders.push(new AttachmentBuilder(f.hostPath, { name: f.name }));
         } catch (err) {
           logger.warn(
             { jid, file: f.name, err },
@@ -458,11 +458,17 @@ export class DiscordChannel implements Channel {
       if (!res.ok || !res.body) {
         throw new Error(`HTTP ${res.status}`);
       }
-      await pipeline(res.body as unknown as NodeJS.ReadableStream, fs.createWriteStream(hostPath));
+      await pipeline(
+        res.body as unknown as NodeJS.ReadableStream,
+        fs.createWriteStream(hostPath),
+      );
 
       return `[${kind}: ${safeName} — read from ${containerPath}]`;
     } catch (err) {
-      logger.warn({ err, attachment: safeName }, 'Discord attachment download failed');
+      logger.warn(
+        { err, attachment: safeName },
+        'Discord attachment download failed',
+      );
       return `[${kind}: ${safeName} (download failed)]`;
     }
   }
@@ -489,10 +495,7 @@ export class DiscordChannel implements Channel {
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
 
-      logger.info(
-        { chatJid, by: user.id },
-        'Discord stop reaction received',
-      );
+      logger.info({ chatJid, by: user.id }, 'Discord stop reaction received');
       this.opts.onStopRequest?.(chatJid);
     } catch (err) {
       logger.debug({ err }, 'Failed to handle Discord reaction');
@@ -647,7 +650,10 @@ export class DiscordChannel implements Channel {
         // 10008 = Unknown Message (already deleted) — fine.
         const code = (err as { code?: number })?.code;
         if (code !== 10008) {
-          logger.debug({ err, messageId: state.messageId }, 'Embed delete failed');
+          logger.debug(
+            { err, messageId: state.messageId },
+            'Embed delete failed',
+          );
         }
       }
     } else {
@@ -688,7 +694,9 @@ export class DiscordChannel implements Channel {
         const embed = new EmbedBuilder()
           .setColor(COLOR_INTERRUPTED)
           .setTitle('Interrupted')
-          .setDescription('_Restart interrupted this turn — no reply was sent._')
+          .setDescription(
+            '_Restart interrupted this turn — no reply was sent._',
+          )
           .setFooter({ text: `${elapsedSec}s elapsed before interrupt` });
         await msg.edit({ embeds: [embed] });
       } catch (err) {
@@ -777,7 +785,9 @@ export class DiscordChannel implements Channel {
     try {
       const channel = await this.client.channels.fetch(state.channelId);
       if (!channel || !('messages' in channel)) return;
-      const msg = await (channel as TextChannel).messages.fetch(state.messageId);
+      const msg = await (channel as TextChannel).messages.fetch(
+        state.messageId,
+      );
       await msg.edit({ embeds });
     } catch (err: unknown) {
       const code = (err as { code?: number })?.code;
@@ -787,7 +797,10 @@ export class DiscordChannel implements Channel {
         void this.removePending(state.messageId);
         logger.debug({ messageId: state.messageId }, 'Progress embed deleted');
       } else {
-        logger.debug({ err, messageId: state.messageId }, 'Progress edit failed');
+        logger.debug(
+          { err, messageId: state.messageId },
+          'Progress edit failed',
+        );
       }
     }
   }
