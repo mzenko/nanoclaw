@@ -41,7 +41,7 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. To attach files (images, documents, etc.) pass their in-container paths in `attachments` — write the file to /workspace/group/ first, then pass that path.",
   {
     text: z.string().describe('The message text to send'),
     sender: z
@@ -50,9 +50,15 @@ server.tool(
       .describe(
         'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.',
       ),
+    attachments: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Optional list of in-container file paths to attach (e.g. ["/workspace/group/chart.png"]). Files must already exist when this tool is called. Channels that don\'t support attachments will fall back to text only.',
+      ),
   },
   async (args) => {
-    const data: Record<string, string | undefined> = {
+    const data: Record<string, unknown> = {
       type: 'message',
       chatJid,
       text: args.text,
@@ -60,10 +66,22 @@ server.tool(
       groupFolder,
       timestamp: new Date().toISOString(),
     };
+    const hasAttachments = !!args.attachments && args.attachments.length > 0;
+    if (hasAttachments) {
+      data.attachments = args.attachments;
+    }
 
     writeIpcFile(MESSAGES_DIR, data);
 
-    return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+    // Attachments are dispatched async on the host with no result file
+    // back to the agent. The host may drop them (path outside mounts,
+    // channel without sendAttachment, oversize file) — flag that to the
+    // agent so it doesn't assume success and skip a retry. Plain-text
+    // sends are reliable enough that the unconditional ack is fine.
+    const text = hasAttachments
+      ? 'Message queued. Note: attachment delivery is best-effort; verify in chat.'
+      : 'Message sent.';
+    return { content: [{ type: 'text' as const, text }] };
   },
 );
 

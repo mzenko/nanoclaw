@@ -1,0 +1,21 @@
+# Bearer-token gate in front of workspace-mcp.
+# WORKSPACE_MCP_TOKEN is injected by the entrypoint at runtime.
+{
+	admin off
+	persist_config off
+}
+
+:8000 {
+	@authed header Authorization "Bearer {$WORKSPACE_MCP_TOKEN}"
+	handle @authed {
+		reverse_proxy 127.0.0.1:8001 {
+			# MCP streamable-http uses long-lived SSE streams.
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+	respond "Unauthorized" 401
+}

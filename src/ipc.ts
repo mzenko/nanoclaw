@@ -8,10 +8,16 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import { translateContainerPath } from './path-translate.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendAttachment?: (
+    jid: string,
+    text: string,
+    files: Array<{ hostPath: string; name: string }>,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -81,9 +87,44 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  const rawAttachments = Array.isArray(data.attachments)
+                    ? (data.attachments as unknown[]).filter(
+                        (a): a is string => typeof a === 'string',
+                      )
+                    : [];
+                  const files: Array<{ hostPath: string; name: string }> = [];
+                  for (const ap of rawAttachments) {
+                    const hostPath = translateContainerPath(ap, sourceGroup);
+                    if (!hostPath) {
+                      logger.warn(
+                        { chatJid: data.chatJid, sourceGroup, path: ap },
+                        'IPC attachment path outside allowed mounts, dropping',
+                      );
+                      continue;
+                    }
+                    files.push({ hostPath, name: path.basename(hostPath) });
+                  }
+                  if (files.length > 0 && deps.sendAttachment) {
+                    await deps.sendAttachment(
+                      data.chatJid,
+                      data.text,
+                      files,
+                    );
+                  } else {
+                    if (files.length > 0) {
+                      logger.warn(
+                        { chatJid: data.chatJid, count: files.length },
+                        'Channel does not support attachments, falling back to text',
+                      );
+                    }
+                    await deps.sendMessage(data.chatJid, data.text);
+                  }
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
+                    {
+                      chatJid: data.chatJid,
+                      sourceGroup,
+                      attachments: files.length,
+                    },
                     'IPC message sent',
                   );
                 } else {

@@ -3,6 +3,7 @@
  * Spawns agent execution in containers and handles IPC
  */
 import { ChildProcess, spawn } from 'child_process';
+import { randomBytes } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -13,10 +14,15 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
+  HA_MCP_TOKEN,
   IDLE_TIMEOUT,
+  NANOCLAW_NETWORK,
   ONECLI_API_KEY,
   ONECLI_URL,
+  PLAYWRIGHT_MCP_TOKEN,
   TIMEZONE,
+  USER_GOOGLE_EMAIL,
+  WORKSPACE_MCP_TOKEN,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -28,13 +34,33 @@ import {
 } from './container-runtime.js';
 import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
-import { RegisteredGroup } from './types.js';
+import { ProgressEvent, RegisteredGroup } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
-// Sentinel markers for robust output parsing (must match agent-runner)
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+// Sentinel markers for robust output parsing. A fresh random nonce is built
+// per container spawn (see runContainerAgent) and appended so a tool that
+// prints the literal string `---NANOCLAW_OUTPUT_START---` (e.g. Bash echoing
+// a file containing the marker, or the SDK's own debug logs) can't masquerade
+// as an envelope. Per-spawn (rather than per-host-process) means a hostile
+// container that exfiltrates its own nonce can't weaponize it against later
+// containers in the same host process. Host generates the nonce, passes via
+// NANOCLAW_MARKER_NONCE env, both sides build matching markers.
+export interface OutputMarkers {
+  outputStart: string;
+  outputEnd: string;
+  progressStart: string;
+  progressEnd: string;
+}
+
+export function makeMarkers(nonce: string): OutputMarkers {
+  return {
+    outputStart: `---NANOCLAW_OUTPUT_START_${nonce}---`,
+    outputEnd: `---NANOCLAW_OUTPUT_END_${nonce}---`,
+    progressStart: `---NANOCLAW_PROGRESS_START_${nonce}---`,
+    progressEnd: `---NANOCLAW_PROGRESS_END_${nonce}---`,
+  };
+}
 
 export interface ContainerInput {
   prompt: string;
@@ -186,17 +212,6 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Gmail credentials directory (for Gmail MCP inside the container)
-  const homeDir = os.homedir();
-  const gmailDir = path.join(homeDir, '.gmail-mcp');
-  if (fs.existsSync(gmailDir)) {
-    mounts.push({
-      hostPath: gmailDir,
-      containerPath: '/home/node/.gmail-mcp',
-      readonly: false, // MCP may need to refresh OAuth tokens
-    });
-  }
-
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
@@ -258,12 +273,49 @@ function buildVolumeMounts(
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  markerNonce: string,
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Per-spawn random suffix on the OUTPUT_/PROGRESS_ markers — see comment
+  // on makeMarkers above.
+  args.push('-e', `NANOCLAW_MARKER_NONCE=${markerNonce}`);
+
+  // Tell workspace-mcp which user's credentials to load from the mounted
+  // workspace-mcp sidecar holds the OAuth client credentials and stored tokens;
+  // the agent only needs to know which Google account to address tools against
+  // and the bearer token for authenticating to the sidecar.
+  if (USER_GOOGLE_EMAIL) {
+    args.push('-e', `USER_GOOGLE_EMAIL=${USER_GOOGLE_EMAIL}`);
+  }
+  if (WORKSPACE_MCP_TOKEN) {
+    args.push('-e', `WORKSPACE_MCP_TOKEN=${WORKSPACE_MCP_TOKEN}`);
+  }
+  if (PLAYWRIGHT_MCP_TOKEN) {
+    args.push('-e', `PLAYWRIGHT_MCP_TOKEN=${PLAYWRIGHT_MCP_TOKEN}`);
+  }
+  if (HA_MCP_TOKEN) {
+    args.push('-e', `HA_MCP_TOKEN=${HA_MCP_TOKEN}`);
+  }
+
+  // Join the sidecar network so `workspace-mcp` resolves over the internal
+  // bridge. The sidecar is started by container/workspace-mcp/start.sh.
+  args.push('--network', NANOCLAW_NETWORK);
+
+  // OneCLI sets HTTP_PROXY/HTTPS_PROXY container-wide for Anthropic gateway
+  // injection. Exempt the sidecar hostname so the SDK talks to it directly
+  // instead of routing internal Docker traffic through the OneCLI proxy.
+  // Every MCP-server sidecar reachable on the nanoclaw bridge needs to be
+  // listed here so Node's fetch doesn't route plain-HTTP intra-network calls
+  // through the OneCLI proxy (which expects to MITM HTTPS).
+  const noProxy =
+    'workspace-mcp,playwright-mcp,ha-mcp,localhost,127.0.0.1';
+  args.push('-e', `NO_PROXY=${noProxy}`);
+  args.push('-e', `no_proxy=${noProxy}`);
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
@@ -311,6 +363,7 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onProgress?: (event: ProgressEvent) => void,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -320,6 +373,10 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
+  // Fresh nonce per spawn — see comment on makeMarkers. Both this host-side
+  // parser and the in-container code build markers from the same nonce.
+  const markerNonce = randomBytes(8).toString('hex');
+  const markers = makeMarkers(markerNonce);
   // Main group uses the default OneCLI agent; others use their own agent.
   const agentIdentifier = input.isMain
     ? undefined
@@ -327,6 +384,7 @@ export async function runContainerAgent(
   const containerArgs = await buildContainerArgs(
     mounts,
     containerName,
+    markerNonce,
     agentIdentifier,
   );
 
@@ -394,35 +452,78 @@ export async function runContainerAgent(
         }
       }
 
-      // Stream-parse for output markers
-      if (onOutput) {
+      // Stream-parse for output and progress markers. Both share `parseBuffer`
+      // and consume the byte ranges they recognize; whichever marker appears
+      // first wins on each pass, so they can interleave freely.
+      if (onOutput || onProgress) {
         parseBuffer += chunk;
-        let startIdx: number;
-        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
-          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
-          if (endIdx === -1) break; // Incomplete pair, wait for more data
+        let advanced = true;
+        while (advanced) {
+          advanced = false;
+          const outStart = onOutput
+            ? parseBuffer.indexOf(markers.outputStart)
+            : -1;
+          const progStart = onProgress
+            ? parseBuffer.indexOf(markers.progressStart)
+            : -1;
+          // Pick whichever marker comes first; ignore those not found.
+          const candidates = [
+            outStart >= 0 ? { kind: 'output' as const, start: outStart } : null,
+            progStart >= 0
+              ? { kind: 'progress' as const, start: progStart }
+              : null,
+          ].filter((c): c is { kind: 'output' | 'progress'; start: number } =>
+            c !== null,
+          );
+          if (candidates.length === 0) break;
+          candidates.sort((a, b) => a.start - b.start);
+          const next = candidates[0];
 
-          const jsonStr = parseBuffer
-            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
-            .trim();
-          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
-
-          try {
-            const parsed: ContainerOutput = JSON.parse(jsonStr);
-            if (parsed.newSessionId) {
-              newSessionId = parsed.newSessionId;
-            }
-            hadStreamingOutput = true;
-            // Activity detected — reset the hard timeout
-            resetTimeout();
-            // Call onOutput for all markers (including null results)
-            // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
-          } catch (err) {
-            logger.warn(
-              { group: group.name, error: err },
-              'Failed to parse streamed output chunk',
+          if (next.kind === 'output') {
+            const endIdx = parseBuffer.indexOf(markers.outputEnd, next.start);
+            if (endIdx === -1) break;
+            const jsonStr = parseBuffer
+              .slice(next.start + markers.outputStart.length, endIdx)
+              .trim();
+            parseBuffer = parseBuffer.slice(
+              endIdx + markers.outputEnd.length,
             );
+            try {
+              const parsed: ContainerOutput = JSON.parse(jsonStr);
+              if (parsed.newSessionId) {
+                newSessionId = parsed.newSessionId;
+              }
+              hadStreamingOutput = true;
+              resetTimeout();
+              outputChain = outputChain.then(() => onOutput!(parsed));
+            } catch (err) {
+              logger.warn(
+                { group: group.name, error: err },
+                'Failed to parse streamed output chunk',
+              );
+            }
+            advanced = true;
+          } else {
+            const endIdx = parseBuffer.indexOf(markers.progressEnd, next.start);
+            if (endIdx === -1) break;
+            const jsonStr = parseBuffer
+              .slice(next.start + markers.progressStart.length, endIdx)
+              .trim();
+            parseBuffer = parseBuffer.slice(
+              endIdx + markers.progressEnd.length,
+            );
+            try {
+              const event: ProgressEvent = JSON.parse(jsonStr);
+              // Fire-and-forget — progress is informational, never blocks
+              // result delivery or the hard timeout.
+              onProgress!(event);
+            } catch (err) {
+              logger.warn(
+                { group: group.name, error: err },
+                'Failed to parse progress event',
+              );
+            }
+            advanced = true;
           }
         }
       }
@@ -641,13 +742,13 @@ export async function runContainerAgent(
       // Legacy mode: parse the last output marker pair from accumulated stdout
       try {
         // Extract JSON between sentinel markers for robust parsing
-        const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
-        const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
+        const startIdx = stdout.indexOf(markers.outputStart);
+        const endIdx = stdout.indexOf(markers.outputEnd);
 
         let jsonLine: string;
         if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
           jsonLine = stdout
-            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+            .slice(startIdx + markers.outputStart.length, endIdx)
             .trim();
         } else {
           // Fallback: last non-empty line (backwards compatibility)

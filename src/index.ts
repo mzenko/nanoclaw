@@ -1,5 +1,7 @@
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
@@ -10,6 +12,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAX_MESSAGES_PER_PROMPT,
+  NANOCLAW_NETWORK,
   ONECLI_URL,
   POLL_INTERVAL,
   TIMEZONE,
@@ -63,7 +66,13 @@ import {
 } from './sender-allowlist.js';
 import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import {
+  Channel,
+  NewMessage,
+  ProgressEvent,
+  ProgressHandle,
+  RegisteredGroup,
+} from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -77,6 +86,11 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// Chats where the user has signalled stop during the active turn. Consumed
+// (and cleared) by processGroupMessages when it sees the resulting error so
+// we advance past the dropped messages instead of retrying them.
+const userStoppedChats = new Set<string>();
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -156,6 +170,14 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
+
+  // Warm any per-channel caches so the new JID can receive messages without
+  // a service restart. Discord uses this to pre-fetch DM channels — without
+  // it, MESSAGE_CREATE for a runtime-registered DM is silently dropped by
+  // discord.js v14.26.x. Fire-and-forget; channels without warmChannel no-op.
+  for (const ch of channels) {
+    void ch.warmChannel?.(jid);
+  }
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
@@ -279,61 +301,139 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  // Per-turn progress UI (e.g. Discord edited embed). The container emits
+  // `begin` / `end` events at turn boundaries; we maintain one handle per
+  // turnId and tie the typing indicator's keepalive to the same lifecycle so
+  // it disappears between turns.
+  const handlesByTurnId = new Map<string, ProgressHandle | null>();
+  let typingKeepalive: NodeJS.Timeout | null = null;
+  const startTyping = () => {
+    void channel.setTyping?.(chatJid, true);
+    if (typingKeepalive) return;
+    typingKeepalive = setInterval(() => {
+      void channel.setTyping?.(chatJid, true);
+    }, 7000);
+  };
+  const stopTyping = () => {
+    if (typingKeepalive) {
+      clearInterval(typingKeepalive);
+      typingKeepalive = null;
+    }
+  };
+  const onProgress = (event: ProgressEvent) => {
+    if (event.kind === 'begin') {
+      startTyping();
+      void (async () => {
+        const handle = (await channel.beginProgress?.(chatJid)) ?? null;
+        handlesByTurnId.set(event.turnId, handle);
+      })();
+    } else if (event.kind === 'end') {
+      stopTyping();
+      const handle = handlesByTurnId.get(event.turnId);
+      if (handle) {
+        // A user-initiated ❌-stop closed stdin, which propagates here as
+        // success=false. Tag it as 'cancelled' so the channel can render a
+        // neutral breadcrumb instead of the alarming red "Failed".
+        const reason =
+          !event.success && userStoppedChats.has(chatJid)
+            ? ('cancelled' as const)
+            : undefined;
+        void channel.endProgress?.(handle, event.success, reason);
+      }
+      handlesByTurnId.delete(event.turnId);
+    } else {
+      const handle = handlesByTurnId.get(event.turnId);
+      if (handle) {
+        void channel.updateProgress?.(handle, event);
+      }
+    }
+  };
+
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  // The userStoppedChats flag is per-turn state — it differentiates "user
+  // pressed ❌" from a real crash. Always clear it on turn-exit so a stale
+  // flag from one turn can't mislabel the next turn's failure as 'cancelled'.
+  try {
+    const output = await runAgent(group, prompt, chatJid, async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+        if (text) {
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
+
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
+
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    }, onProgress);
+
+    // Safety net — if the container exits without emitting `end` for a turn
+    // (crash, kill, etc.), close out any handles still in flight as failed so
+    // they don't sit orphaned.
+    stopTyping();
+    if (idleTimer) clearTimeout(idleTimer);
+    // Same cancellation tagging as the inline 'end' branch — covers crashes
+    // where the container exits without emitting `end` after a ❌-stop.
+    const safetyReason = userStoppedChats.has(chatJid)
+      ? ('cancelled' as const)
+      : undefined;
+    for (const [tid, handle] of handlesByTurnId) {
+      if (handle) {
+        await channel.endProgress?.(handle, false, safetyReason);
+      }
+      handlesByTurnId.delete(tid);
     }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
-
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
-
-  await channel.setTyping?.(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
-
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
+    if (output === 'error' || hadError) {
+      // User-initiated stop: don't retry, just leave the cursor advanced past
+      // the messages we just attempted so the queue won't re-fire them.
+      if (userStoppedChats.has(chatJid)) {
+        logger.info(
+          { group: group.name },
+          'Agent stopped by user — dropping the in-flight batch',
+        );
+        saveState();
+        return true;
+      }
+      // If we already sent output to the user, don't roll back the cursor —
+      // the user got their response and re-processing would send duplicates.
+      if (outputSentToUser) {
+        logger.warn(
+          { group: group.name },
+          'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        );
+        return true;
+      }
+      // Roll back cursor so retries can re-process these messages
+      lastAgentTimestamp[chatJid] = previousCursor;
+      saveState();
       logger.warn(
         { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        'Agent error, rolled back message cursor for retry',
       );
-      return true;
+      return false;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
-    );
-    return false;
-  }
 
-  return true;
+    return true;
+  } finally {
+    userStoppedChats.delete(chatJid);
+  }
 }
 
 async function runAgent(
@@ -341,6 +441,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onProgress?: (event: ProgressEvent) => void,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -396,6 +497,7 @@ async function runAgent(
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
+      onProgress,
     );
 
     if (output.newSessionId) {
@@ -568,8 +670,36 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+// Each MCP-server sidecar gets a `container/<name>/start.sh` that's idempotent
+// (no-ops if already on the latest image) and reads its own config from .env.
+// Failure is non-fatal so a single missing sidecar doesn't block boot.
+function ensureSidecar(name: string): void {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const script = path.resolve(here, '..', `container/${name}/start.sh`);
+  if (!fs.existsSync(script)) return;
+  try {
+    const result = spawnSync('bash', [script], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, NANOCLAW_NETWORK },
+    });
+    if (result.status === 0) {
+      logger.info({ sidecar: name }, 'Sidecar ensured');
+    } else {
+      logger.warn(
+        { sidecar: name, stderr: result.stderr?.toString().slice(-500) },
+        'Sidecar start.sh exited non-zero',
+      );
+    }
+  } catch (err) {
+    logger.warn({ sidecar: name, err }, 'Failed to invoke sidecar start.sh');
+  }
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+  ensureSidecar('workspace-mcp');
+  ensureSidecar('playwright-mcp');
+  ensureSidecar('ha-mcp');
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -672,6 +802,11 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onStopRequest: (chatJid: string) => {
+      logger.info({ chatJid }, 'Stop requested by user reaction');
+      userStoppedChats.add(chatJid);
+      queue.closeStdin(chatJid);
+    },
   };
 
   // Create and connect all registered channels.
@@ -693,6 +828,15 @@ async function main(): Promise<void> {
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
+  }
+
+  // Mark any progress embeds left orphaned by the previous run as interrupted.
+  for (const ch of channels) {
+    try {
+      await ch.sweepStaleProgress?.();
+    } catch (err) {
+      logger.warn({ channel: ch.name, err }, 'sweepStaleProgress failed');
+    }
   }
 
   // Start subsystems (independently of connection handler)
@@ -717,6 +861,13 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    sendAttachment: (jid, text, files) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      // Channels without sendAttachment fall back to text in the watcher.
+      if (!channel.sendAttachment) return channel.sendMessage(jid, text);
+      return channel.sendAttachment(jid, text, files);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

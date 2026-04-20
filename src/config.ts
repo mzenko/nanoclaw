@@ -11,6 +11,11 @@ const envConfig = readEnvFile([
   'ONECLI_URL',
   'ONECLI_API_KEY',
   'TZ',
+  'CONTAINER_IMAGE',
+  'USER_GOOGLE_EMAIL',
+  'WORKSPACE_MCP_TOKEN',
+  'PLAYWRIGHT_MCP_TOKEN',
+  'HA_MCP_TOKEN',
 ]);
 
 export const ASSISTANT_NAME =
@@ -43,7 +48,18 @@ export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
 export const CONTAINER_IMAGE =
-  process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+  process.env.CONTAINER_IMAGE ||
+  envConfig.CONTAINER_IMAGE ||
+  'nanoclaw-agent:latest';
+export const USER_GOOGLE_EMAIL =
+  process.env.USER_GOOGLE_EMAIL || envConfig.USER_GOOGLE_EMAIL || '';
+export const WORKSPACE_MCP_TOKEN =
+  process.env.WORKSPACE_MCP_TOKEN || envConfig.WORKSPACE_MCP_TOKEN || '';
+export const PLAYWRIGHT_MCP_TOKEN =
+  process.env.PLAYWRIGHT_MCP_TOKEN || envConfig.PLAYWRIGHT_MCP_TOKEN || '';
+export const HA_MCP_TOKEN =
+  process.env.HA_MCP_TOKEN || envConfig.HA_MCP_TOKEN || '';
+export const NANOCLAW_NETWORK = process.env.NANOCLAW_NETWORK || 'nanoclaw';
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,

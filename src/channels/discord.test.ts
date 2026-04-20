@@ -1,3 +1,6 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
 // --- Mocks ---
@@ -8,10 +11,18 @@ vi.mock('./registry.js', () => ({ registerChannel: vi.fn() }));
 // Mock env reader (used by the factory, not needed in unit tests)
 vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 
+// Per-process unique data dir so concurrent test workers can't stomp each
+// other's pending-progress file.
+const TEST_DATA_DIR = path.join(
+  os.tmpdir(),
+  `nanoclaw-test-data-${process.pid}`,
+);
+
 // Mock config
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  DATA_DIR: path.join(os.tmpdir(), `nanoclaw-test-data-${process.pid}`),
 }));
 
 // Mock logger
@@ -33,6 +44,7 @@ const clientRef = vi.hoisted(() => ({ current: null as any }));
 vi.mock('discord.js', () => {
   const Events = {
     MessageCreate: 'messageCreate',
+    MessageReactionAdd: 'messageReactionAdd',
     ClientReady: 'ready',
     Error: 'error',
   };
@@ -42,6 +54,7 @@ vi.mock('discord.js', () => {
     GuildMessages: 2,
     MessageContent: 4,
     DirectMessages: 8,
+    GuildMessageReactions: 16,
   };
 
   class MockClient {
@@ -77,10 +90,42 @@ vi.mock('discord.js', () => {
       return this._ready;
     }
 
+    // Per-channel state, keyed by channel id, so progress tests can find the
+    // embed message they "sent" via beginProgress.
+    channelState: Record<
+      string,
+      { sent: any[]; messages: Record<string, any> }
+    > = {};
+
     channels = {
-      fetch: vi.fn().mockResolvedValue({
-        send: vi.fn().mockResolvedValue(undefined),
-        sendTyping: vi.fn().mockResolvedValue(undefined),
+      fetch: vi.fn(async (id: string) => {
+        if (!this.channelState[id]) {
+          this.channelState[id] = { sent: [], messages: {} };
+        }
+        const state = this.channelState[id];
+        const send = vi.fn(async (payload: any) => {
+          const msgId = `embed_${state.sent.length + 1}`;
+          const msg = {
+            id: msgId,
+            channelId: id,
+            author: { id: '999888777', bot: true },
+            payload,
+            edit: vi.fn(async (next: any) => {
+              msg.payload = next;
+            }),
+            delete: vi.fn().mockResolvedValue(undefined),
+          };
+          state.sent.push(msg);
+          state.messages[msgId] = msg;
+          return msg;
+        });
+        return {
+          send,
+          sendTyping: vi.fn().mockResolvedValue(undefined),
+          messages: {
+            fetch: vi.fn(async (mid: string) => state.messages[mid]),
+          },
+        };
       }),
     };
 
@@ -92,11 +137,45 @@ vi.mock('discord.js', () => {
   // Mock TextChannel type
   class TextChannel {}
 
+  // Minimal builder — captures what the SUT set so tests can introspect.
+  class EmbedBuilder {
+    data: any = {};
+    setColor(c: number) {
+      this.data.color = c;
+      return this;
+    }
+    setTitle(t: string) {
+      this.data.title = t;
+      return this;
+    }
+    setDescription(d: string) {
+      this.data.description = d;
+      return this;
+    }
+    addFields(...fs: any[]) {
+      this.data.fields = (this.data.fields || []).concat(fs);
+      return this;
+    }
+    setFooter(f: any) {
+      this.data.footer = f;
+      return this;
+    }
+  }
+
+  // Captures the path/name pair the SUT passed so tests can assert on the
+  // exact files included in a sendAttachment call.
+  class AttachmentBuilder {
+    constructor(public attachment: string, public opts?: { name?: string }) {}
+  }
+
   return {
     Client: MockClient,
     Events,
     GatewayIntentBits,
+    Partials: { Channel: 0, Message: 1, Reaction: 2, User: 3 },
     TextChannel,
+    EmbedBuilder,
+    AttachmentBuilder,
   };
 });
 
@@ -161,9 +240,7 @@ function createMessage(overrides: {
     member: overrides.memberDisplayName
       ? { displayName: overrides.memberDisplayName }
       : null,
-    guild: overrides.guildName
-      ? { name: overrides.guildName }
-      : null,
+    guild: overrides.guildName ? { name: overrides.guildName } : null,
     channel: {
       name: overrides.channelName ?? 'general',
       messages: {
@@ -490,7 +567,7 @@ describe('DiscordChannel', () => {
   // --- Attachments ---
 
   describe('attachments', () => {
-    it('stores image attachment with placeholder', async () => {
+    it('flags unregistered chat in image attachment placeholder', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -508,12 +585,12 @@ describe('DiscordChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: '[Image: photo.png]',
+          content: '[Image: photo.png (download failed)]',
         }),
       );
     });
 
-    it('stores video attachment with placeholder', async () => {
+    it('flags unregistered chat in video attachment placeholder', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -531,12 +608,12 @@ describe('DiscordChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: '[Video: clip.mp4]',
+          content: '[Video: clip.mp4 (download failed)]',
         }),
       );
     });
 
-    it('stores file attachment with placeholder', async () => {
+    it('flags unregistered chat in file attachment placeholder', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -554,7 +631,7 @@ describe('DiscordChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: '[File: report.pdf]',
+          content: '[File: report.pdf (download failed)]',
         }),
       );
     });
@@ -577,7 +654,7 @@ describe('DiscordChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: 'Check this out\n[Image: photo.jpg]',
+          content: 'Check this out\n[Image: photo.jpg (download failed)]',
         }),
       );
     });
@@ -601,7 +678,8 @@ describe('DiscordChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: '[Image: a.png]\n[File: b.txt]',
+          content:
+            '[Image: a.png (download failed)]\n[File: b.txt (download failed)]',
         }),
       );
     });
@@ -641,8 +719,11 @@ describe('DiscordChannel', () => {
 
       await channel.sendMessage('dc:1234567890123456', 'Hello');
 
-      const fetchedChannel = await currentClient().channels.fetch('1234567890123456');
-      expect(currentClient().channels.fetch).toHaveBeenCalledWith('1234567890123456');
+      const fetchedChannel =
+        await currentClient().channels.fetch('1234567890123456');
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
     });
 
     it('strips dc: prefix from JID', async () => {
@@ -700,6 +781,151 @@ describe('DiscordChannel', () => {
     });
   });
 
+  // --- sendAttachment ---
+
+  describe('sendAttachment', () => {
+    // Ensure a real file exists for fs.statSync inside sendAttachment.
+    const tmpFile = path.join(os.tmpdir(), `nanoclaw-attach-${process.pid}.txt`);
+    const bigTmpFile = path.join(
+      os.tmpdir(),
+      `nanoclaw-attach-big-${process.pid}.bin`,
+    );
+
+    beforeEach(() => {
+      fs.writeFileSync(tmpFile, 'hello world');
+    });
+
+    afterEach(() => {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {
+        /* */
+      }
+      try {
+        fs.unlinkSync(bigTmpFile);
+      } catch {
+        /* */
+      }
+    });
+
+    it('sends text + one file as a single message', async () => {
+      const channel = new DiscordChannel('test-token', createTestOpts());
+      await channel.connect();
+
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendAttachment(
+        'dc:1234567890123456',
+        'here you go',
+        [{ hostPath: tmpFile, name: 'note.txt' }],
+      );
+
+      expect(mockChannel.send).toHaveBeenCalledTimes(1);
+      const payload = mockChannel.send.mock.calls[0][0];
+      expect(payload.content).toBe('here you go');
+      expect(payload.files).toHaveLength(1);
+      expect(payload.files[0].attachment).toBe(tmpFile);
+      expect(payload.files[0].opts.name).toBe('note.txt');
+    });
+
+    it('drops oversize (>10 MiB) files, still sends text', async () => {
+      // 11 MiB sparse file — exceeds the 10 MiB cap.
+      const fd = fs.openSync(bigTmpFile, 'w');
+      fs.ftruncateSync(fd, 11 * 1024 * 1024);
+      fs.closeSync(fd);
+
+      const channel = new DiscordChannel('test-token', createTestOpts());
+      await channel.connect();
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendAttachment(
+        'dc:1234567890123456',
+        'caption',
+        [{ hostPath: bigTmpFile, name: 'big.bin' }],
+      );
+
+      expect(mockChannel.send).toHaveBeenCalledTimes(1);
+      const payload = mockChannel.send.mock.calls[0][0];
+      expect(payload.content).toBe('caption');
+      expect(payload.files).toHaveLength(0);
+    });
+
+    it('drops unreadable files (statSync throws) and still sends text', async () => {
+      const channel = new DiscordChannel('test-token', createTestOpts());
+      await channel.connect();
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendAttachment(
+        'dc:1234567890123456',
+        'caption',
+        [{ hostPath: '/nonexistent/path.png', name: 'ghost.png' }],
+      );
+
+      expect(mockChannel.send).toHaveBeenCalledTimes(1);
+      const payload = mockChannel.send.mock.calls[0][0];
+      expect(payload.files).toHaveLength(0);
+    });
+
+    it('handles empty files array', async () => {
+      const channel = new DiscordChannel('test-token', createTestOpts());
+      await channel.connect();
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendAttachment(
+        'dc:1234567890123456',
+        'just text',
+        [],
+      );
+
+      expect(mockChannel.send).toHaveBeenCalledTimes(1);
+      const payload = mockChannel.send.mock.calls[0][0];
+      expect(payload.content).toBe('just text');
+      expect(payload.files).toHaveLength(0);
+    });
+
+    it('attaches files only to first chunk when text > 2000 chars', async () => {
+      const channel = new DiscordChannel('test-token', createTestOpts());
+      await channel.connect();
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      const longText = 'x'.repeat(3000);
+      await channel.sendAttachment(
+        'dc:1234567890123456',
+        longText,
+        [{ hostPath: tmpFile, name: 'note.txt' }],
+      );
+
+      expect(mockChannel.send).toHaveBeenCalledTimes(2);
+      // First call carries the file, second is text-only
+      const first = mockChannel.send.mock.calls[0][0];
+      expect(first.files).toHaveLength(1);
+      const second = mockChannel.send.mock.calls[1][0];
+      // Second call is sent as a plain string (not a payload object)
+      expect(typeof second).toBe('string');
+      expect(second).toBe('x'.repeat(1000));
+    });
+  });
+
   // --- ownsJid ---
 
   describe('ownsJid', () => {
@@ -747,6 +973,9 @@ describe('DiscordChannel', () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
+      // Warm-cache pre-fetch happens during connect(); reset so the
+      // assertion below only measures setTyping's behavior.
+      currentClient().channels.fetch.mockClear();
 
       await channel.setTyping('dc:1234567890123456', false);
 
@@ -771,6 +1000,444 @@ describe('DiscordChannel', () => {
     it('has name "discord"', () => {
       const channel = new DiscordChannel('test-token', createTestOpts());
       expect(channel.name).toBe('discord');
+    });
+  });
+
+  // --- Progress lifecycle ---
+
+  describe('progress lifecycle', () => {
+    const PENDING_FILE = path.join(
+      TEST_DATA_DIR,
+      'discord-progress-pending.json',
+    );
+
+    beforeEach(() => {
+      try {
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    afterEach(() => {
+      try {
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    async function flushTimers(): Promise<void> {
+      // Let the rate-limit setTimeout in scheduleProgressEdit fire — needs to
+      // be longer than PROGRESS_EDIT_GAP_MS (1100ms).
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+
+    it('beginProgress sends placeholder embed and persists pending record', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const handle = await channel.beginProgress('dc:1234567890123456');
+
+      expect(handle).not.toBeNull();
+      expect(handle!.channel).toBe('discord');
+      const data = handle!.data as { channelId: string; messageId: string };
+      expect(data.channelId).toBe('1234567890123456');
+      expect(data.messageId).toMatch(/^embed_/);
+
+      // The placeholder was actually "sent"
+      const state = currentClient().channelState['1234567890123456'];
+      expect(state.sent.length).toBe(1);
+      expect(state.sent[0].payload.embeds.length).toBe(1);
+
+      // And recorded to the pending file
+      expect(fs.existsSync(PENDING_FILE)).toBe(true);
+      const records = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf-8'));
+      expect(records).toHaveLength(1);
+      expect(records[0].messageId).toBe(data.messageId);
+    });
+
+    it('updateProgress(tool_use) edits embed with the tool call', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      const handle = await channel.beginProgress('dc:1234567890123456');
+      const turnId = 't1';
+
+      // First updateProgress should fire immediately (lastEditAt=0 fix).
+      await channel.updateProgress(handle!, {
+        kind: 'tool_use',
+        turnId,
+        name: 'Bash',
+        summary: 'command=ls',
+      });
+      // Give the in-flight edit a tick to settle.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const state = currentClient().channelState['1234567890123456'];
+      const msg = state.sent[0];
+      // edit was called at least once
+      expect(msg.edit).toHaveBeenCalled();
+      const lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      const parentEmbed = lastPayload.embeds[0];
+      const activity = parentEmbed.data.fields?.find(
+        (f: any) => f.name === 'Activity',
+      );
+      expect(activity).toBeDefined();
+      expect(activity.value).toContain('Bash');
+      expect(activity.value).toContain('command=ls');
+    });
+
+    it('subagent_begin renders an extra embed; subagent_end removes it', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      const handle = await channel.beginProgress('dc:1234567890123456');
+      const turnId = 't1';
+
+      await channel.updateProgress(handle!, {
+        kind: 'subagent_begin',
+        turnId,
+        subagentId: 'task-1',
+        name: 'researcher',
+      });
+      await flushTimers();
+
+      const state = currentClient().channelState['1234567890123456'];
+      const msg = state.sent[0];
+      let lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      expect(lastPayload.embeds.length).toBe(2);
+      expect(lastPayload.embeds[1].data.title).toContain('researcher');
+
+      await channel.updateProgress(handle!, {
+        kind: 'subagent_end',
+        turnId,
+        subagentId: 'task-1',
+      });
+      await flushTimers();
+
+      lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      expect(lastPayload.embeds.length).toBe(1);
+    });
+
+    it('subagent_begin past cap evicts the oldest subagent', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      const handle = await channel.beginProgress('dc:1234567890123456');
+      const turnId = 't1';
+
+      // Open 9 (cap) + 1 (overflow) → first one should be evicted.
+      for (let i = 0; i < 10; i++) {
+        await channel.updateProgress(handle!, {
+          kind: 'subagent_begin',
+          turnId,
+          subagentId: `task-${i}`,
+          name: `agent-${i}`,
+        });
+      }
+      await flushTimers();
+
+      const state = currentClient().channelState['1234567890123456'];
+      const msg = state.sent[0];
+      const lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      // 1 parent + 9 subagents = 10 embeds
+      expect(lastPayload.embeds.length).toBe(10);
+      // Oldest (`agent-0`) should have been evicted; newest (`agent-9`) kept.
+      const titles = lastPayload.embeds.slice(1).map((e: any) => e.data.title);
+      expect(titles.some((t: string) => t.includes('agent-0'))).toBe(false);
+      expect(titles.some((t: string) => t.includes('agent-9'))).toBe(true);
+    });
+
+    it('endProgress(success) deletes the embed and clears pending', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      const handle = await channel.beginProgress('dc:1234567890123456');
+
+      await channel.endProgress(handle!, true);
+
+      const state = currentClient().channelState['1234567890123456'];
+      const msg = state.sent[0];
+      expect(msg.delete).toHaveBeenCalled();
+
+      // Pending file emptied
+      const records = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf-8'));
+      expect(records).toHaveLength(0);
+    });
+
+    it('endProgress(failure) keeps embed as red breadcrumb and clears subagent fields', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      const handle = await channel.beginProgress('dc:1234567890123456');
+      const turnId = 't1';
+
+      // Add some activity
+      await channel.updateProgress(handle!, {
+        kind: 'tool_use',
+        turnId,
+        name: 'Bash',
+        summary: 'command=true',
+      });
+      await channel.updateProgress(handle!, {
+        kind: 'subagent_begin',
+        turnId,
+        subagentId: 'sub-1',
+        name: 'helper',
+      });
+      await channel.endProgress(handle!, false);
+
+      const state = currentClient().channelState['1234567890123456'];
+      const msg = state.sent[0];
+      // Should NOT have been deleted
+      expect(msg.delete).not.toHaveBeenCalled();
+      // Last edit should be the failure breadcrumb
+      const lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      const parent = lastPayload.embeds[0];
+      expect(parent.data.title).toBe('Failed');
+      expect(parent.data.color).toBe(0xed4245); // COLOR_FAILED
+      // Subagent embeds and Activity field cleared
+      expect(lastPayload.embeds.length).toBe(1);
+      expect(parent.data.fields ?? []).toHaveLength(0);
+    });
+
+    it('endProgress(failure, "cancelled") renders grey Cancelled breadcrumb', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      const handle = await channel.beginProgress('dc:1234567890123456');
+      await channel.endProgress(handle!, false, 'cancelled');
+
+      const state = currentClient().channelState['1234567890123456'];
+      const msg = state.sent[0];
+      expect(msg.delete).not.toHaveBeenCalled();
+      const lastPayload = msg.edit.mock.calls[msg.edit.mock.calls.length - 1][0];
+      const parent = lastPayload.embeds[0];
+      expect(parent.data.title).toBe('Cancelled');
+      expect(parent.data.color).toBe(0x95a5a6); // COLOR_INTERRUPTED
+    });
+
+    it('endProgress awaits in-flight edit before applying terminal state', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      const handle = await channel.beginProgress('dc:1234567890123456');
+
+      const state = currentClient().channelState['1234567890123456'];
+      const msg = state.sent[0];
+      // Make the in-flight edit slow so the race window is large.
+      let editResolve: () => void = () => {};
+      const editGate = new Promise<void>((r) => {
+        editResolve = r;
+      });
+      msg.edit.mockImplementationOnce(async () => {
+        await editGate;
+      });
+
+      // Fire-and-forget update kicks off a slow edit.
+      void channel.updateProgress(handle!, {
+        kind: 'tool_use',
+        turnId: 't1',
+        name: 'Bash',
+        summary: 'command=sleep',
+      });
+      // Give the kick a tick to register inFlightEdit.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // endProgress(success) should wait for the slow edit to resolve before
+      // calling delete().
+      const endPromise = channel.endProgress(handle!, true);
+      // Delete shouldn't have been called yet — endProgress is blocked on the
+      // gated edit.
+      expect(msg.delete).not.toHaveBeenCalled();
+      editResolve();
+      await endPromise;
+      expect(msg.delete).toHaveBeenCalled();
+    });
+
+    it('sweepStaleProgress edits orphaned embeds to "Interrupted" and clears pending', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      // Pre-populate as if a prior run crashed mid-turn.
+      fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
+      const stale = [
+        {
+          channelId: '1234567890123456',
+          messageId: 'orphan-msg-1',
+          jid: 'dc:1234567890123456',
+          startedAt: Date.now() - 10_000,
+        },
+      ];
+      fs.writeFileSync(PENDING_FILE, JSON.stringify(stale));
+
+      // Seed the channel mock with that orphan message so messages.fetch()
+      // resolves it.
+      const state = currentClient().channelState['1234567890123456'] ?? {
+        sent: [],
+        messages: {},
+      };
+      const orphan = {
+        id: 'orphan-msg-1',
+        edit: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue(undefined),
+      };
+      state.messages['orphan-msg-1'] = orphan;
+      currentClient().channelState['1234567890123456'] = state;
+
+      await channel.sweepStaleProgress();
+
+      expect(orphan.edit).toHaveBeenCalled();
+      const editPayload = orphan.edit.mock.calls[0][0];
+      expect(editPayload.embeds[0].data.title).toBe('Interrupted');
+      const records = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf-8'));
+      expect(records).toHaveLength(0);
+    });
+
+    it('atomic pending writes survive an interleaved persist+remove', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      // Two parallel begins → both must end up in the pending file in order.
+      const [h1, h2] = await Promise.all([
+        channel.beginProgress('dc:1234567890123456'),
+        channel.beginProgress('dc:1234567890123456'),
+      ]);
+      expect(h1).not.toBeNull();
+      expect(h2).not.toBeNull();
+
+      const records = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf-8'));
+      expect(records).toHaveLength(2);
+      const ids = records.map((r: any) => r.messageId);
+      expect(ids).toContain((h1!.data as any).messageId);
+      expect(ids).toContain((h2!.data as any).messageId);
+    });
+  });
+
+  // --- Stop reaction (❌) ---
+
+  describe('stop reaction', () => {
+    function createReaction(opts: {
+      emoji?: string;
+      partial?: boolean;
+      messagePartial?: boolean;
+      msgChannelId?: string;
+      msgAuthorId?: string;
+    }) {
+      const msg = {
+        partial: opts.messagePartial ?? false,
+        channelId: opts.msgChannelId ?? '1234567890123456',
+        author: {
+          id: opts.msgAuthorId ?? '999888777', // bot id by default
+        },
+        fetch: vi.fn(async function (this: any) {
+          this.partial = false;
+          return this;
+        }),
+      };
+      const reaction: any = {
+        emoji: { name: opts.emoji ?? '❌' },
+        partial: opts.partial ?? false,
+        message: msg,
+        fetch: vi.fn(async function (this: any) {
+          this.partial = false;
+          return this;
+        }),
+      };
+      return reaction;
+    }
+
+    async function triggerReaction(reaction: any, user: any) {
+      const handlers =
+        currentClient().eventHandlers.get('messageReactionAdd') || [];
+      for (const h of handlers) await h(reaction, user);
+    }
+
+    it('calls onStopRequest when bot user receives ❌ on its own message', async () => {
+      const onStopRequest = vi.fn();
+      const opts = createTestOpts({ onStopRequest });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerReaction(createReaction({}), { id: 'user-1', bot: false });
+
+      expect(onStopRequest).toHaveBeenCalledWith('dc:1234567890123456');
+    });
+
+    it('ignores reactions from bots', async () => {
+      const onStopRequest = vi.fn();
+      const opts = createTestOpts({ onStopRequest });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerReaction(createReaction({}), { id: 'user-2', bot: true });
+
+      expect(onStopRequest).not.toHaveBeenCalled();
+    });
+
+    it('ignores non-❌ emojis', async () => {
+      const onStopRequest = vi.fn();
+      const opts = createTestOpts({ onStopRequest });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerReaction(createReaction({ emoji: '👍' }), {
+        id: 'user-1',
+        bot: false,
+      });
+
+      expect(onStopRequest).not.toHaveBeenCalled();
+    });
+
+    it('ignores reactions on messages not authored by the bot', async () => {
+      const onStopRequest = vi.fn();
+      const opts = createTestOpts({ onStopRequest });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerReaction(
+        createReaction({ msgAuthorId: 'some-other-user' }),
+        { id: 'user-1', bot: false },
+      );
+
+      expect(onStopRequest).not.toHaveBeenCalled();
+    });
+
+    it('ignores reactions on unregistered channels', async () => {
+      const onStopRequest = vi.fn();
+      const opts = createTestOpts({ onStopRequest });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerReaction(
+        createReaction({ msgChannelId: '9999999999999999' }),
+        { id: 'user-1', bot: false },
+      );
+
+      expect(onStopRequest).not.toHaveBeenCalled();
+    });
+
+    it('hydrates partial reaction + message before checking', async () => {
+      const onStopRequest = vi.fn();
+      const opts = createTestOpts({ onStopRequest });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const reaction = createReaction({
+        partial: true,
+        messagePartial: true,
+      });
+      await triggerReaction(reaction, { id: 'user-1', bot: false });
+
+      expect(reaction.fetch).toHaveBeenCalled();
+      expect(reaction.message.fetch).toHaveBeenCalled();
+      expect(onStopRequest).toHaveBeenCalled();
     });
   });
 });

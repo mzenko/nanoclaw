@@ -14,6 +14,7 @@
  *   Final marker after loop ends signals completion.
  */
 
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
@@ -114,13 +115,163 @@ async function readStdin(): Promise<string> {
   });
 }
 
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+// Markers carry a per-spawn random suffix (NANOCLAW_MARKER_NONCE, set by
+// the host runner). Required — if missing, the host parser would never match
+// our markers and every turn would silently look like it produced no output.
+// Better to fail loud at boot than to ship empty replies.
+const NONCE_FROM_ENV = process.env.NANOCLAW_MARKER_NONCE;
+if (!NONCE_FROM_ENV) {
+  throw new Error(
+    'NANOCLAW_MARKER_NONCE is not set. The host container-runner must pass ' +
+      'this env so output/progress markers match what it parses. Refusing to ' +
+      'start.',
+  );
+}
+const MARKER_NONCE = `_${NONCE_FROM_ENV}`;
+const OUTPUT_START_MARKER = `---NANOCLAW_OUTPUT_START${MARKER_NONCE}---`;
+const OUTPUT_END_MARKER = `---NANOCLAW_OUTPUT_END${MARKER_NONCE}---`;
+const PROGRESS_START_MARKER = `---NANOCLAW_PROGRESS_START${MARKER_NONCE}---`;
+const PROGRESS_END_MARKER = `---NANOCLAW_PROGRESS_END${MARKER_NONCE}---`;
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
   console.log(OUTPUT_END_MARKER);
+}
+
+type ProgressEvent =
+  | { kind: 'begin'; turnId: string }
+  | {
+      kind: 'tool_use';
+      turnId: string;
+      name: string;
+      summary?: string;
+      subagentId?: string;
+    }
+  | {
+      kind: 'subagent_begin';
+      turnId: string;
+      subagentId: string;
+      name: string;
+    }
+  | { kind: 'subagent_end'; turnId: string; subagentId: string }
+  | { kind: 'text_chunk'; turnId: string; text: string }
+  | { kind: 'status'; turnId: string; label: string }
+  | { kind: 'end'; turnId: string; success: boolean; error?: string };
+
+function writeProgress(event: ProgressEvent): void {
+  console.log(PROGRESS_START_MARKER);
+  console.log(JSON.stringify(event));
+  console.log(PROGRESS_END_MARKER);
+}
+
+// Build a one-line "what is this tool doing" summary suitable for showing in
+// progress UIs. Skips fields that would dump file bodies or large content,
+// truncates aggressively. The MCP servers in this stack receive stub
+// credentials (proxied by OneCLI) so the agent itself doesn't hold live
+// secrets, but a user pasting a token into chat can still flow into a tool
+// arg — so we explicitly redact secret-looking key names.
+const SECRET_KEY_RE =
+  /^(token|api[_-]?key|apikey|secret|password|passwd|authorization|auth|bearer|credential|x[-_]api[-_]key)$/i;
+
+function isSecretKey(key: string): boolean {
+  return SECRET_KEY_RE.test(key);
+}
+
+// Scrub embedded secrets from arbitrary tool-arg strings (Bash commands in
+// particular). Catches Authorization headers, common <key><sep><value>
+// secret patterns, and the http://x:<token>@host OneCLI proxy syntax. The
+// rules are intentionally narrow: they only match where the surrounding
+// syntax strongly implies "secret here", to avoid clobbering benign content.
+type RedactRule = {
+  re: RegExp;
+  replace: (match: string, ...groups: string[]) => string;
+};
+
+const REDACT_RULES: RedactRule[] = [
+  // Authorization: Bearer X  /  Authorization: Basic X  /  Authorization: <raw>
+  // The scheme keyword is now optional so a bare `Authorization: token123`
+  // also redacts.
+  {
+    re: /(Authorization\s*:\s*(?:(?:Bearer|Basic)\s+)?)(\S+)/gi,
+    replace: (_m, prefix) => `${prefix}<redacted>`,
+  },
+  // curl: -H 'Authorization: ...'  /  --header "Authorization: ..."
+  {
+    re: /(-H\s+["']?Authorization\s*:\s*(?:(?:Bearer|Basic)\s+)?)(\S+)/gi,
+    replace: (_m, prefix) => `${prefix}<redacted>`,
+  },
+  // <key><sep><value> with sep ∈ {=, :}; key ends with one of the secret
+  // suffixes (token, secret, password, etc.). Catches FOO_TOKEN=x,
+  // mytoken=x, apiKey: "x", api_key=x, --secret xxx, etc. Anchored on
+  // start-of-string OR a non-word char so identifiers like `mytoken` (where
+  // \b doesn't fire between letters) still match.
+  {
+    re: /(^|[^A-Za-z0-9_])((?:[A-Za-z][A-Za-z0-9_]*)?(?:token|api[_-]?key|apikey|secret|password|passwd|bearer|credential))(\s*[:=]\s*["']?)([^"'\s,;}\]]+)/gi,
+    replace: (_m, pre, key, sep) => `${pre}${key}${sep}<redacted>`,
+  },
+  // OneCLI proxy creds embedded in URLs: http://user:token@host
+  {
+    re: /(https?:\/\/[^:@\s/]+:)[^@\s]+(@)/gi,
+    replace: (_m, pre, suf) => `${pre}<redacted>${suf}`,
+  },
+];
+
+function redactSecrets(s: string): string {
+  let out = s;
+  for (const { re, replace } of REDACT_RULES) {
+    out = out.replace(re, replace);
+  }
+  return out;
+}
+
+function summarizeToolInput(
+  name: string,
+  input: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  // Drop bulky content fields regardless of tool — Write/Edit/etc. would dump
+  // entire file bodies into the embed.
+  const SKIP_KEYS = new Set([
+    'content',
+    'new_string',
+    'old_string',
+    'file_text',
+    'body',
+  ]);
+  // Per-tool "headline" field — the one identifier most useful for status.
+  const HEADLINE: Record<string, string> = {
+    Bash: 'command',
+    Read: 'file_path',
+    Write: 'file_path',
+    Edit: 'file_path',
+    Glob: 'pattern',
+    Grep: 'pattern',
+    WebFetch: 'url',
+    WebSearch: 'query',
+  };
+  const headline = HEADLINE[name];
+  let text: string;
+  if (headline && typeof input[headline] === 'string') {
+    text = `${headline}=${redactSecrets(input[headline] as string)}`;
+  } else {
+    const parts: string[] = [];
+    for (const [k, v] of Object.entries(input)) {
+      if (SKIP_KEYS.has(k)) continue;
+      if (isSecretKey(k)) {
+        parts.push(`${k}=<redacted>`);
+        continue;
+      }
+      if (typeof v === 'string') parts.push(`${k}=${redactSecrets(v)}`);
+      else if (typeof v === 'number' || typeof v === 'boolean')
+        parts.push(`${k}=${v}`);
+      // skip arrays/objects — too noisy for a one-liner
+    }
+    if (parts.length === 0) return undefined;
+    text = parts.join(' ');
+  }
+  if (text.length > 80) text = text.slice(0, 79) + '…';
+  return text;
 }
 
 function log(message: string): void {
@@ -371,12 +522,19 @@ function waitForIpcMessage(): Promise<string | null> {
  * allowing agent teams subagents to run to completion.
  * Also pipes IPC messages into the stream during the query.
  */
+interface McpTokens {
+  workspace: string;
+  playwright: string;
+  ha: string;
+}
+
 async function runQuery(
   prompt: string,
   sessionId: string | undefined,
   mcpServerPath: string,
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
+  mcpTokens: McpTokens,
   resumeAt?: string,
 ): Promise<{
   newSessionId?: string;
@@ -386,14 +544,37 @@ async function runQuery(
   const stream = new MessageStream();
   stream.push(prompt);
 
+  let newSessionId: string | undefined;
+  let lastAssistantUuid: string | undefined;
+  let messageCount = 0;
+  let resultCount = 0;
+  // turnId rotates per turn boundary — at the initial prompt and again every
+  // time a follow-up IPC message is pushed into the stream. End is emitted
+  // when each `result` message arrives. The host uses turnId to scope its
+  // per-turn UI handle (e.g. one Discord embed per turn).
+  let turnId = randomUUID();
+  writeProgress({ kind: 'begin', turnId });
+
+  // Track open subagents so we can emit subagent_end when the parent receives
+  // the matching tool_result. Keyed by the parent's Task() tool_use.id.
+  const openSubagents = new Set<string>();
+
+  // AbortController for the entire query. When the user signals stop (close
+  // sentinel from the host), abort fires and the SDK exits the for-await
+  // loop with a terminal 'aborted_*' subtype. The orchestrator will spawn a
+  // fresh container on the next message; session state is preserved by
+  // resume:sessionId so the user's context is not lost.
+  const abortController = new AbortController();
+
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
+      log('Close sentinel detected during query, aborting current turn');
       closedDuringQuery = true;
+      abortController.abort();
       stream.end();
       ipcPolling = false;
       return;
@@ -401,16 +582,14 @@ async function runQuery(
     const messages = drainIpcInput();
     for (const text of messages) {
       log(`Piping IPC message into active query (${text.length} chars)`);
+      // New IPC message = new turn beginning.
+      turnId = randomUUID();
+      writeProgress({ kind: 'begin', turnId });
       stream.push(text);
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -438,6 +617,9 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      // Cancellation: abort() from pollIpcDuringQuery unwinds the SDK loop on
+      // user-requested stop.
+      abortController,
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -458,6 +640,7 @@ async function runQuery(
         'Grep',
         'WebSearch',
         'WebFetch',
+        'Agent',
         'Task',
         'TaskOutput',
         'TaskStop',
@@ -469,7 +652,9 @@ async function runQuery(
         'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
-        'mcp__gmail__*',
+        'mcp__workspace__*',
+        'mcp__playwright__*',
+        'mcp__homeassistant__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -485,9 +670,30 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
-        gmail: {
-          command: 'npx',
-          args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
+        workspace: {
+          type: 'http',
+          url:
+            process.env.WORKSPACE_MCP_URL ??
+            'http://workspace-mcp:8000/mcp',
+          headers: {
+            Authorization: `Bearer ${mcpTokens.workspace}`,
+          },
+        },
+        playwright: {
+          type: 'http',
+          url:
+            process.env.PLAYWRIGHT_MCP_URL ??
+            'http://playwright-mcp:8000/mcp',
+          headers: {
+            Authorization: `Bearer ${mcpTokens.playwright}`,
+          },
+        },
+        homeassistant: {
+          type: 'http',
+          url: process.env.HA_MCP_URL ?? 'http://ha-mcp:8000/mcp',
+          headers: {
+            Authorization: `Bearer ${mcpTokens.ha}`,
+          },
         },
       },
       hooks: {
@@ -506,11 +712,94 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // Subagent attribution: parent_tool_use_id is set on every assistant
+      // message coming from a Task()-spawned subagent. Null means the parent
+      // agent itself.
+      const subagentId =
+        (message as { parent_tool_use_id?: string | null })
+          .parent_tool_use_id ?? undefined;
+      const blocks = ((message as unknown as {
+        message?: { content?: Array<Record<string, unknown>> };
+      }).message?.content ?? []) as Array<Record<string, unknown>>;
+      for (const block of blocks) {
+        if (block.type === 'tool_use' && typeof block.name === 'string') {
+          // The parent inviting a subagent — emit subagent_begin so the host
+          // can open a new section. The SDK currently exposes this tool as
+          // `Agent` (older names: `Task`). Accept both so a future rename
+          // doesn't silently break subagent attribution again. The tool's
+          // `description` field is the human-friendly label.
+          if (
+            (block.name === 'Agent' || block.name === 'Task') &&
+            !subagentId &&
+            typeof block.id === 'string'
+          ) {
+            const input = block.input as Record<string, unknown> | undefined;
+            const desc =
+              (input && typeof input.description === 'string'
+                ? input.description
+                : undefined) ?? 'subagent';
+            openSubagents.add(block.id);
+            writeProgress({
+              kind: 'subagent_begin',
+              turnId,
+              subagentId: block.id,
+              name: desc,
+            });
+          }
+          const summary = summarizeToolInput(
+            block.name,
+            block.input as Record<string, unknown> | undefined,
+          );
+          writeProgress({
+            kind: 'tool_use',
+            turnId,
+            name: block.name,
+            ...(summary ? { summary } : {}),
+            ...(subagentId ? { subagentId } : {}),
+          });
+        } else if (block.type === 'text' && typeof block.text === 'string') {
+          writeProgress({
+            kind: 'text_chunk',
+            turnId,
+            text: block.text.slice(0, 280),
+          });
+        }
+      }
+    }
+
+    // Subagent end: the parent's user message contains tool_result blocks for
+    // its own outstanding tool_use ids. When one matches an open subagent,
+    // that subagent's work has wrapped — close its section.
+    if (message.type === 'user') {
+      const blocks = ((message as unknown as {
+        message?: { content?: Array<Record<string, unknown>> };
+      }).message?.content ?? []) as Array<Record<string, unknown>>;
+      for (const block of blocks) {
+        if (
+          block.type === 'tool_result' &&
+          typeof block.tool_use_id === 'string' &&
+          openSubagents.has(block.tool_use_id)
+        ) {
+          openSubagents.delete(block.tool_use_id);
+          writeProgress({
+            kind: 'subagent_end',
+            turnId,
+            subagentId: block.tool_use_id,
+          });
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+    }
+
+    if (
+      message.type === 'system' &&
+      (message as { subtype?: string }).subtype === 'compact_boundary'
+    ) {
+      writeProgress({ kind: 'status', turnId, label: 'compacting' });
     }
 
     if (
@@ -538,6 +827,12 @@ async function runQuery(
         status: 'success',
         result: textResult || null,
         newSessionId,
+      });
+      // Each result closes a turn — flip the embed and clear typing.
+      writeProgress({
+        kind: 'end',
+        turnId,
+        success: message.subtype === 'success',
       });
     }
   }
@@ -626,6 +921,21 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Capture MCP sidecar bearer tokens then DELETE them from process.env.
+  // The SDK and any Bash subprocess it spawns inherit env at fork time —
+  // once these are out of process.env, an `echo $HA_MCP_TOKEN` returns
+  // empty. The captured locals stay in this process for the mcpServers
+  // Authorization headers. HTTPS_PROXY is intentionally left in env because
+  // legitimate subprocess HTTPS calls go through OneCLI.
+  const mcpTokens: McpTokens = {
+    workspace: process.env.WORKSPACE_MCP_TOKEN ?? '',
+    playwright: process.env.PLAYWRIGHT_MCP_TOKEN ?? '',
+    ha: process.env.HA_MCP_TOKEN ?? '',
+  };
+  delete process.env.WORKSPACE_MCP_TOKEN;
+  delete process.env.PLAYWRIGHT_MCP_TOKEN;
+  delete process.env.HA_MCP_TOKEN;
+
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = {
@@ -693,6 +1003,7 @@ async function main(): Promise<void> {
         mcpServerPath,
         containerInput,
         sdkEnv,
+        mcpTokens,
         resumeAt,
       );
       if (queryResult.newSessionId) {

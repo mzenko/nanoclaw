@@ -2,21 +2,22 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 
-// Sentinel markers must match container-runner.ts
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-
-// Mock config
+// Mock config — must export every symbol container-runner.ts imports.
 vi.mock('./config.js', () => ({
   CONTAINER_IMAGE: 'nanoclaw-agent:latest',
   CONTAINER_MAX_OUTPUT_SIZE: 10485760,
   CONTAINER_TIMEOUT: 1800000, // 30min
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
+  HA_MCP_TOKEN: '',
   IDLE_TIMEOUT: 1800000, // 30min
+  NANOCLAW_NETWORK: 'nanoclaw',
   ONECLI_API_KEY: '',
   ONECLI_URL: 'http://localhost:10254',
+  PLAYWRIGHT_MCP_TOKEN: '',
   TIMEZONE: 'America/Los_Angeles',
+  USER_GOOGLE_EMAIL: '',
+  WORKSPACE_MCP_TOKEN: '',
 }));
 
 // Mock logger
@@ -90,13 +91,20 @@ function createFakeProcess() {
 
 let fakeProc: ReturnType<typeof createFakeProcess>;
 
+// Per-spawn marker nonce: capture it from the spawn args so the test can
+// emit matching markers on the fake stdout.
+let lastSpawnArgs: string[] = [];
+
 // Mock child_process.spawn
 vi.mock('child_process', async () => {
   const actual =
     await vi.importActual<typeof import('child_process')>('child_process');
   return {
     ...actual,
-    spawn: vi.fn(() => fakeProc),
+    spawn: vi.fn((_cmd: string, args: string[]) => {
+      lastSpawnArgs = args;
+      return fakeProc;
+    }),
     exec: vi.fn(
       (_cmd: string, _opts: unknown, cb?: (err: Error | null) => void) => {
         if (cb) cb(null);
@@ -106,8 +114,24 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import {
+  runContainerAgent,
+  ContainerOutput,
+  makeMarkers,
+} from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
+
+function capturedMarkers(): ReturnType<typeof makeMarkers> {
+  // The container runner sets `-e NANOCLAW_MARKER_NONCE=<hex>` in the args
+  // it passes to spawn. Pull the nonce out so the test emits matching markers.
+  const idx = lastSpawnArgs.findIndex((a) =>
+    a.startsWith('NANOCLAW_MARKER_NONCE='),
+  );
+  if (idx === -1) {
+    throw new Error('NANOCLAW_MARKER_NONCE not found in spawn args');
+  }
+  return makeMarkers(lastSpawnArgs[idx].split('=')[1]);
+}
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
@@ -128,7 +152,8 @@ function emitOutputMarker(
   output: ContainerOutput,
 ) {
   const json = JSON.stringify(output);
-  proc.stdout.push(`${OUTPUT_START_MARKER}\n${json}\n${OUTPUT_END_MARKER}\n`);
+  const m = capturedMarkers();
+  proc.stdout.push(`${m.outputStart}\n${json}\n${m.outputEnd}\n`);
 }
 
 describe('container-runner timeout behavior', () => {
@@ -149,6 +174,10 @@ describe('container-runner timeout behavior', () => {
       () => {},
       onOutput,
     );
+
+    // Let runContainerAgent finish its async setup (mounts, args, spawn)
+    // so capturedMarkers() can read NANOCLAW_MARKER_NONCE from spawn args.
+    await vi.advanceTimersByTimeAsync(0);
 
     // Emit output with a result
     emitOutputMarker(fakeProc, {
@@ -208,6 +237,10 @@ describe('container-runner timeout behavior', () => {
       () => {},
       onOutput,
     );
+
+    // Let runContainerAgent finish its async setup (mounts, args, spawn)
+    // so capturedMarkers() can read NANOCLAW_MARKER_NONCE from spawn args.
+    await vi.advanceTimersByTimeAsync(0);
 
     // Emit output
     emitOutputMarker(fakeProc, {

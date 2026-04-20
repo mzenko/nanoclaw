@@ -9,6 +9,8 @@ export interface ChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  // Optional: user requested an in-flight turn be stopped (e.g. ❌ reaction on Discord).
+  onStopRequest?: (chatJid: string) => void;
 }
 
 export type ChannelFactory = (opts: ChannelOpts) => Channel | null;
