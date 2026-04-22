@@ -898,6 +898,9 @@ async function runQuery(
         sysMsg.subtype === 'task_notification' &&
         typeof sysMsg.task_id === 'string'
       ) {
+        log(
+          `Task notification: task=${sysMsg.task_id} status=${sysMsg.status ?? '?'} summary=${sysMsg.summary ?? ''}`,
+        );
         const tuid =
           sysMsg.tool_use_id ?? taskIdToToolUseId.get(sysMsg.task_id);
         if (tuid && openSubagents.has(tuid)) {
@@ -924,20 +927,6 @@ async function runQuery(
       (message as { subtype?: string }).subtype === 'compact_boundary'
     ) {
       writeProgress({ kind: 'status', turnId, label: 'compacting' });
-    }
-
-    if (
-      message.type === 'system' &&
-      (message as { subtype?: string }).subtype === 'task_notification'
-    ) {
-      const tn = message as {
-        task_id: string;
-        status: string;
-        summary: string;
-      };
-      log(
-        `Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`,
-      );
     }
 
     if (message.type === 'result') {

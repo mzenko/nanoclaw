@@ -13,7 +13,7 @@ const REGIONS = [
   'Oceania',
 ] as const;
 
-const ORDER_BY_OPTIONS = ['', 'lowest_mileage'] as const;
+const ORDER_BY_OPTIONS = ['lowest_mileage'] as const;
 
 // `source` is a free string — seats.aero adds programs frequently and a hard-coded
 // enum drifts. Canonical list from https://developers.seats.aero/reference/concepts-copy
@@ -30,14 +30,13 @@ const SOURCE_HINT =
 const dateRegex = /^\d{4}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])$/;
 const dateField = z.string().regex(dateRegex, 'YYYY-MM-DD');
 
-// Accepts IATA airport codes OR seats.aero "multi-city codes" (3-letter codes
-// like NYC, LON, USA, EUR, UAH that the API expands server-side to a list of
-// airports). Same character shape as IATA so one regex covers both.
+// Accepts IATA airport codes OR seats.aero "multi-city codes" — mostly 3-letter
+// (NYC, LON, USA, EUR, UAH) but at least one is 5-letter (INDIA), so allow 3-5.
 const airportField = z
   .string()
   .regex(
-    /^[A-Z]{3}(,[A-Z]{3})*$/,
-    'IATA or multi-city code(s), comma-delimited if multiple, e.g. "JFK", "NYC", or "USA"',
+    /^[A-Z]{3,5}(,[A-Z]{3,5})*$/,
+    'IATA or multi-city code(s), comma-delimited if multiple, e.g. "JFK", "NYC", "USA", "INDIA"',
   );
 
 // --- /search (Cached Search) --------------------------------------
@@ -109,7 +108,11 @@ export const GetFlightsSchema = {
   order_by: z
     .enum(ORDER_BY_OPTIONS)
     .optional()
-    .describe('Default is by departure date + cabin; "lowest_mileage" sorts by price.'),
+    .describe(
+      'Sort order. Only "lowest_mileage" supported. MCP defaults to it (overrides ' +
+        'the API default of departure-date + cabin), since cheapest-first is what ' +
+        'matches the typical "find me flights" intent.',
+    ),
   take: z
     .number()
     .int()

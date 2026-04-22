@@ -42,12 +42,24 @@ async function callSeats(
 
   const qs = params.toString();
   const url = qs ? `${BASE_URL}${path}?${qs}` : `${BASE_URL}${path}`;
-  const res = await fetch(url, {
-    headers: {
-      accept: 'application/json',
-      'Partner-Authorization': apiKey,
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: {
+        accept: 'application/json',
+        'Partner-Authorization': apiKey,
+      },
+    });
+  } catch (e) {
+    // Network-level failures (DNS, ECONNRESET, AbortError, TLS, etc.) — return
+    // a tool-error rather than letting it propagate as an MCP transport error.
+    return {
+      kind: 'err',
+      result: err(
+        `seats.aero network error: ${e instanceof Error ? e.message : String(e)}`,
+      ),
+    };
+  }
 
   // seats.aero exposes the daily quota in a response header. Surface it so
   // the user can see how much budget is left in a turn.
