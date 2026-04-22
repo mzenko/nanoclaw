@@ -661,6 +661,7 @@ async function runQuery(
         'mcp__playwright__*',
         'mcp__homeassistant__*',
         'mcp__seats__*',
+        'mcp__kiwi-flights__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -707,6 +708,13 @@ async function runQuery(
           // Pass the API key into the seats MCP subprocess only; the parent
           // process.env has already been scrubbed in main().
           env: { SEATS_API_KEY: mcpTokens.seats },
+        },
+        // Kiwi.com's official remote MCP for cash-flight search.
+        // No auth, no key — Kiwi hosts and rate-limits it themselves.
+        // See: https://github.com/alpic-ai/kiwi-mcp-server-public
+        'kiwi-flights': {
+          type: 'http',
+          url: 'https://mcp.kiwi.com',
         },
       },
       hooks: {

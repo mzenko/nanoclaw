@@ -34,7 +34,41 @@ Text inside `<internal>` tags is logged but not sent to the user. If you've alre
 
 When working as a sub-agent or teammate, only use `send_message` if instructed to by the main agent.
 
-## Flight Search (seats.aero)
+## Flight Search
+
+You have two flight-search tool families:
+
+- **`mcp__kiwi-flights__*`** — cash/revenue flights via Kiwi.com's official MCP. Use this for "find me a flight" / "what does it cost" / "book me a trip" requests.
+- **`mcp__seats__*`** — award flights via seats.aero (mileage programs). Use this for "what does it cost in miles" / "redeem points" / "use my Aeroplan miles" requests.
+
+When the user asks "should I burn miles or pay cash?", run both in parallel and present the comparison.
+
+---
+
+### Cash flights (Kiwi.com)
+
+`mcp__kiwi-flights__search-flight` — single tool. Round-trip or one-way, ±3 day flexibility, passenger mix (adult/child/infant), cabin class (economy/premium/business/first). Each result returns a direct booking link.
+
+**What Kiwi does well:**
+- Specific routes, specific dates → "JFK to NRT, Feb 14-21, business class"
+- Flexible-day searches (±3 days)
+- Comprehensive cash inventory including their virtual-interlining combinations (self-transfer routes other engines won't surface, often the cheapest option)
+- Returns curated "best" options pre-filtered, not a flood — easy to summarize
+
+**What Kiwi can't do (set user expectations up-front when these come up):**
+- ❌ Multi-city itineraries (open-jaw, stopovers) — only round-trip and one-way
+- ❌ Baggage filtering — can't restrict to fares with checked bags included
+- ❌ Max-flight-duration filter
+- ❌ Loyalty program / status integration
+- ❌ Date-range exploration wider than ±3 days — for "cheapest weekend in March" or "anywhere in Asia under $800," Kiwi will need many separate calls
+
+**For broad exploratory searches** ("when is Tokyo cheapest in 2027", "anywhere warm in February for under $600", "best weekend to fly to Madrid in spring"): Kiwi can do these but needs to be called multiple times across different date windows. Be transparent with the user that you're sweeping a date range, mention how many searches you ran, and that there may be even cheaper combinations you didn't explore. If a request fundamentally needs a tool Kiwi doesn't have (multi-city, "anywhere" inspiration), tell the user that's a current limitation.
+
+**Always remind the user**: prices and availability change constantly — confirm on the booking page before purchasing. Kiwi's booking link goes directly to checkout.
+
+---
+
+### Award flights (seats.aero)
 
 You have `mcp__seats__*` tools for finding award flights. Data is **cached** (may be hours stale) — always tell the user "verify on the airline site before booking."
 
