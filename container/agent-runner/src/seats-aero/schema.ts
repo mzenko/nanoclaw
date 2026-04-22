@@ -30,11 +30,14 @@ const SOURCE_HINT =
 const dateRegex = /^\d{4}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])$/;
 const dateField = z.string().regex(dateRegex, 'YYYY-MM-DD');
 
+// Accepts IATA airport codes OR seats.aero "multi-city codes" (3-letter codes
+// like NYC, LON, USA, EUR, UAH that the API expands server-side to a list of
+// airports). Same character shape as IATA so one regex covers both.
 const airportField = z
   .string()
   .regex(
     /^[A-Z]{3}(,[A-Z]{3})*$/,
-    'IATA code(s), comma-delimited if multiple, e.g. "JFK" or "JFK,EWR,LGA"',
+    'IATA or multi-city code(s), comma-delimited if multiple, e.g. "JFK", "NYC", or "USA"',
   );
 
 // --- /search (Cached Search) --------------------------------------
@@ -43,10 +46,15 @@ const airportField = z
 // `sources` filter — the upstream MCP exposed none of these.
 export const GetFlightsSchema = {
   originAirport: airportField.describe(
-    'Origin IATA code(s). Single ("JFK") or comma-delimited ("JFK,EWR,LGA").',
+    'Origin IATA code or seats.aero multi-city code. Single ("JFK", "NYC", "USA"), ' +
+      'or comma-delimited list ("JFK,EWR,BOS"). Multi-city codes expand server-side ' +
+      '(e.g. NYC = JFK+LGA+EWR, LON = LHR+LGW+LCY+STN+LTN, USA = 13 major US airports, ' +
+      'EUR = 24 major EU airports, UAH = United hubs, AAH = American hubs, DLL = Delta hubs). ' +
+      'Use these for broad geographic searches in one call instead of paginating manually.',
   ),
   destinationAirport: airportField.describe(
-    'Destination IATA code(s). Single ("NRT") or comma-delimited ("NRT,HND").',
+    'Destination IATA code or multi-city code. Same expansion rules as originAirport ' +
+      '(e.g. "NRT", "TYO" for Tokyo metro, "ASA" for major Asian airports).',
   ),
   startDate: dateField
     .optional()

@@ -114,9 +114,30 @@ The `/trips/{id}` response also has top-level **`booking_links`** and **`carrier
 
 If the user said "no connections," either pass `only_direct_flights: true` to `get_flights` (filters at the API), or drill in and filter trips to `Stops === 0`. The first is cheaper if you know up-front.
 
+### Multi-city codes (powerful for broad searches)
+
+The seats.aero API accepts special **3-letter multi-city codes** that expand server-side to lists of airports. Use these instead of long comma-delimited lists, especially for exploratory searches across regions or airline networks. **One call with `USA → EUR` returns availability across 13 US origins × 24 EU destinations × ~19 mileage programs.**
+
+Common codes:
+
+| Type | Examples |
+|---|---|
+| Metro areas | `NYC` (JFK,LGA,EWR), `LON` (LHR,LGW,LCY,STN,LTN), `TYO` (HND,NRT), `PAR` (CDG,ORY), `WAS` (IAD,DCA,BWI), `CHI` (ORD,MDW), `SAO`, `RIO`, `SEL`, `OSA`, `BJS` |
+| US regions | `EST` (East Coast), `WST` (West Coast), `CAL` (California), `MIW` (Midwest), `QBA` (Bay Area), `QLA` (LA metro), `QMI` (Miami metro), `HAW` |
+| Continents/regions | `USA`, `EUR`, `ASA` (Asia large), `SAS` (Southeast Asia), `MEA` (Middle East), `CAR` (Caribbean), `CAM` (Central America), `SAM` (South America), `LAM` (Latin America), `QAF` (Africa), `ANZ` (Australia+NZ), `SCH` (Schengen), `INDIA`, `CNA` (mainland China), `JPN`, `BRL` (Brazil) |
+| Country | `CAD` (Canada), `MXC` (Mexico), `GER`, `UKD` |
+| **Airline hubs** | `UAH` (United), `AAH` (American), `DLL` (Delta) — use these when the user mentions a specific carrier's network |
+
+**When to use them:**
+- Broad exploration: "what's available from anywhere in the US to Europe in July?" → `originAirport: "USA", destinationAirport: "EUR"` (one call)
+- "What does United have out of any of its hubs to Asia?" → `originAirport: "UAH", destinationAirport: "ASA", sources: "united"` (one call)
+- Metro-area queries: "flying to/from NYC" → `NYC` is shorter than `JFK,LGA,EWR` and the API guarantees the same expansion
+
+The full list is at https://docs.seats.aero/article/multi-city-codes — there are ~40 codes; the table above covers the highest-value ones.
+
 ### `get_flights` parameters
 
-- **Airports**: single IATA or comma-delimited (`"JFK,EWR,LGA"` → `"NRT,HND"`).
+- **Airports**: single IATA or comma-delimited (`"JFK,EWR,LGA"` → `"NRT,HND"`), OR a multi-city code (see section above).
 - **Dates**: `startDate` + `endDate` in `YYYY-MM-DD`. Single day = set them equal.
 - **`cabins`**: comma-delimited from `{economy, premium, business, first}` (e.g. `"business,first"`).
 - **`sources`**: comma-delimited program filter (e.g. `"aeroplan,united"`). Canonical list from the [Concepts](https://developers.seats.aero/reference/concepts-copy) doc: aeroplan, alaska, american, aeromexico, azul, connectmiles, delta, emirates, ethiopian, etihad, eurobonus, finnair, flyingblue, frontier, jetblue, lufthansa, qantas, qatar, saudia, singapore, smiles, spirit, turkish, united, velocity, virginatlantic. The list is **not exhaustive** — the API returns sources beyond it (e.g. `british` for British Airways Executive Club). Pass any source the user mentions; the API will 400 on unknown values.
