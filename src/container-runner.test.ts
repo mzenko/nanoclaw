@@ -15,6 +15,7 @@ vi.mock('./config.js', () => ({
   ONECLI_API_KEY: '',
   ONECLI_URL: 'http://localhost:10254',
   PLAYWRIGHT_MCP_TOKEN: '',
+  SEATS_API_KEY: '',
   TIMEZONE: 'America/Los_Angeles',
   USER_GOOGLE_EMAIL: '',
   WORKSPACE_MCP_TOKEN: '',

@@ -16,6 +16,7 @@ const envConfig = readEnvFile([
   'WORKSPACE_MCP_TOKEN',
   'PLAYWRIGHT_MCP_TOKEN',
   'HA_MCP_TOKEN',
+  'SEATS_API_KEY',
 ]);
 
 export const ASSISTANT_NAME =
@@ -59,6 +60,8 @@ export const PLAYWRIGHT_MCP_TOKEN =
   process.env.PLAYWRIGHT_MCP_TOKEN || envConfig.PLAYWRIGHT_MCP_TOKEN || '';
 export const HA_MCP_TOKEN =
   process.env.HA_MCP_TOKEN || envConfig.HA_MCP_TOKEN || '';
+export const SEATS_API_KEY =
+  process.env.SEATS_API_KEY || envConfig.SEATS_API_KEY || '';
 export const NANOCLAW_NETWORK = process.env.NANOCLAW_NETWORK || 'nanoclaw';
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',

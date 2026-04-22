@@ -20,6 +20,7 @@ import {
   ONECLI_API_KEY,
   ONECLI_URL,
   PLAYWRIGHT_MCP_TOKEN,
+  SEATS_API_KEY,
   TIMEZONE,
   USER_GOOGLE_EMAIL,
   WORKSPACE_MCP_TOKEN,
@@ -300,6 +301,9 @@ async function buildContainerArgs(
   }
   if (HA_MCP_TOKEN) {
     args.push('-e', `HA_MCP_TOKEN=${HA_MCP_TOKEN}`);
+  }
+  if (SEATS_API_KEY) {
+    args.push('-e', `SEATS_API_KEY=${SEATS_API_KEY}`);
   }
 
   // Join the sidecar network so `workspace-mcp` resolves over the internal

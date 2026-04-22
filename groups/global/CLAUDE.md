@@ -34,6 +34,62 @@ Text inside `<internal>` tags is logged but not sent to the user. If you've alre
 
 When working as a sub-agent or teammate, only use `send_message` if instructed to by the main agent.
 
+## Flight Search (seats.aero)
+
+You have `mcp__seats__*` tools for finding award flights. Data is **cached** (may be hours stale) — always tell the user "verify on the airline site before booking."
+
+### Endpoint selection (from the [Concepts](https://developers.seats.aero/reference/concepts-copy) doc)
+
+> "Cached Search is the most common endpoint, but Bulk Availability can be used when many results are required."
+
+- **`get_flights` (Cached Search)** — for searches between specific airports within specific date ranges, across all mileage programs. This is the default for any "find me flights from X to Y" request.
+- **`get_bulk_avail` (Bulk Availability)** — for retrieving lots of availability for one specific program (e.g. "all availability from North America to Europe on Delta SkyMiles").
+- **`get_trips`** — drills into a single Availability summary returned by `get_flights`, returning the actual trips (flight numbers, segments, times, aircraft, booking links).
+- **`get_routes`** — lists routes a program flies; useful for "what does X fly" or to confirm a route exists before searching.
+
+### Standard workflow ("find me flights")
+
+1. Call `get_flights` with `originAirport`, `destinationAirport`, `startDate`/`endDate`, and `cabins`.
+2. Pick 1-3 best result rows (cheapest mileage, preferred program).
+3. **For each, pass the row's top-level `ID` field to `get_trips`** — NOT items from the row's `AvailabilityTrips` field. Per the seats.aero docs: "you call the Get Trips API with the ID of the Availability."
+4. Summarize: program, mileage cost, taxes, flight numbers, times, aircraft. Include booking links from the `get_trips` response if present.
+
+### `get_flights` parameters
+
+- **Airports**: single IATA or comma-delimited (`"JFK,EWR,LGA"` → `"NRT,HND"`).
+- **Dates**: `startDate` + `endDate` in `YYYY-MM-DD`. Single day = set them equal.
+- **`cabins`**: comma-delimited from `{economy, premium, business, first}` (e.g. `"business,first"`).
+- **`sources`**: comma-delimited program filter (e.g. `"aeroplan,united"`). Canonical list: aeroplan, alaska, american, aeromexico, azul, connectmiles, delta, emirates, ethiopian, etihad, eurobonus, finnair, flyingblue, frontier, jetblue, lufthansa, qantas, qatar, saudia, singapore, smiles, spirit, turkish, united, velocity, virginatlantic.
+- **`carriers`**: 2-char airline codes, comma-delimited (`"DL,AA"`).
+- Default `order_by: "lowest_mileage"` unless the user specifies otherwise.
+
+### `get_bulk_avail` parameters
+
+- **`source`**: required, single program (see canonical list above).
+- **`cabin`** (singular): one of `{economy, premium, business, first}`.
+- **`originRegion`/`destinationRegion`**: exact strings — `North America`, `South America`, `Africa`, `Asia`, `Europe`, `Oceania`.
+- Payloads can be large; tune `take` if you don't need the default 500.
+
+### Program quirks (from the [Concepts](https://developers.seats.aero/reference/concepts-copy) table)
+
+- **No taxes returned**: qatar, turkish, singapore.
+- **No seat counts returned**: qantas, emirates, connectmiles, azul, american (mostly), qatar, turkish, singapore.
+- **Cabin support varies**: e.g. eurobonus has only economy + business, not premium or first. If the user asks for first class on a program that doesn't sell it, say so up-front.
+
+### Quotas and filters
+
+- **1,000 calls/day** total across all four endpoints, resets midnight UTC. Each response includes `X-RateLimit-Remaining` — surface it if the user is iterating.
+- `include_filtered` defaults to false. Per-endpoint meaning per the seats.aero docs: on cached-search/bulk-avail it returns "raw (unfiltered) results only"; on get-trips it includes "expensive dynamically-priced results that may have been filtered out." Set true only if the user explicitly asks for raw or dynamic-priced options.
+- Don't run more than 2-3 broad searches per turn unless asked — each `get_flights` plus a couple of `get_trips` is plenty for one answer.
+
+### Pagination
+
+If you need a second page: pass `skip` = the running count of results already received, and `cursor` = the `cursor` value from the **first** response (not the latest). Object IDs may repeat across pages — dedupe by `ID`.
+
+### Live Search
+
+The `/live` endpoint is **not available on the Pro tier** (commercial partners only), so there's no `live_search` tool. If the user asks for real-time availability, tell them you only have cached data and offer to search that.
+
 ## Your Workspace
 
 Files you create are saved in `/workspace/group/`. Use this for notes, research, or anything that should persist.

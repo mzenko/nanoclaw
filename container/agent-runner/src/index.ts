@@ -526,12 +526,17 @@ interface McpTokens {
   workspace: string;
   playwright: string;
   ha: string;
+  // seats.aero uses a non-standard `Partner-Authorization` header which
+  // OneCLI doesn't rewrite, so the API key lives in container env. Captured
+  // and scrubbed from process.env in main() like the others (M7 pattern).
+  seats: string;
 }
 
 async function runQuery(
   prompt: string,
   sessionId: string | undefined,
   mcpServerPath: string,
+  seatsMcpPath: string,
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   mcpTokens: McpTokens,
@@ -655,6 +660,7 @@ async function runQuery(
         'mcp__workspace__*',
         'mcp__playwright__*',
         'mcp__homeassistant__*',
+        'mcp__seats__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -694,6 +700,13 @@ async function runQuery(
           headers: {
             Authorization: `Bearer ${mcpTokens.ha}`,
           },
+        },
+        seats: {
+          command: 'node',
+          args: [seatsMcpPath],
+          // Pass the API key into the seats MCP subprocess only; the parent
+          // process.env has already been scrubbed in main().
+          env: { SEATS_API_KEY: mcpTokens.seats },
         },
       },
       hooks: {
@@ -931,10 +944,12 @@ async function main(): Promise<void> {
     workspace: process.env.WORKSPACE_MCP_TOKEN ?? '',
     playwright: process.env.PLAYWRIGHT_MCP_TOKEN ?? '',
     ha: process.env.HA_MCP_TOKEN ?? '',
+    seats: process.env.SEATS_API_KEY ?? '',
   };
   delete process.env.WORKSPACE_MCP_TOKEN;
   delete process.env.PLAYWRIGHT_MCP_TOKEN;
   delete process.env.HA_MCP_TOKEN;
+  delete process.env.SEATS_API_KEY;
 
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
@@ -945,6 +960,7 @@ async function main(): Promise<void> {
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  const seatsMcpPath = path.join(__dirname, 'seats-aero', 'server.js');
 
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
@@ -1001,6 +1017,7 @@ async function main(): Promise<void> {
         prompt,
         sessionId,
         mcpServerPath,
+        seatsMcpPath,
         containerInput,
         sdkEnv,
         mcpTokens,
