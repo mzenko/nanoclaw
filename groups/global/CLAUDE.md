@@ -176,11 +176,16 @@ Full code → airport mappings (use this table to answer "what does code X inclu
 - `AAH` (American hubs) → MIA, DFW, PHX, CLT, PHL, JFK, ORD
 - `DLL` (Delta hubs) → ATL, DTW, MSP, SLC, SEA, LAX, JFK, BOS
 
+**⚠️ Codes are curated lists, not exhaustive.** `USA` is "13 major US airports" — not every US airport. Combining `EST + WST + MIW` adds ~17 more airports that `USA` excludes (LGA, PHL, DCA, CLT, SJC, SAN, PDX, LAS, SLC, PHX, MDW, DTW, CLE, CVG, IND, MSP, PIT). Even then, many smaller US airports (AUS, BNA, MCO, RDU, RSW, SAV, etc.) aren't in any code at all. Same applies to `EUR`, `ASA`, `BRL`, etc. — all "Large Airports" sets.
+
 **When to use them:**
-- Broad exploration: "what's available from anywhere in the US to Europe in July?" → `originAirport: "USA", destinationAirport: "EUR"` (one call)
-- "What does United have out of any of its hubs to Asia?" → `originAirport: "UAH", destinationAirport: "ASA", sources: "united"` (one call)
-- Metro-area queries: "flying to/from NYC" → `NYC` is shorter than `JFK,LGA,EWR` and the API guarantees the same expansion
-- When the user names an airport, you can tell them which codes contain it by scanning this table.
+- Broad exploration with hub-bias acceptable: "what's available from anywhere major in the US to Europe in July?" → `originAirport: "USA", destinationAirport: "EUR"` (one call, but biased to major hubs)
+- "What does United have out of any of its hubs to Asia?" → `originAirport: "UAH", destinationAirport: "ASA", sources: "united"` (one call — the hub codes are exact carrier hub lists, so these ARE exhaustive for that carrier)
+- Metro-area queries: "flying to/from NYC" → `NYC` is exhaustive for the documented metro area (JFK+LGA+EWR)
+- When the user names a small/secondary airport, prefer **comma-delimited explicit IATA codes** over a region code so nothing gets missed
+- If the user wants comprehensive coverage of a region, combine codes (`"USA,EST,WST,MIW,HAW,CAL"` is broader than `"USA"` alone) — but warn the user that even combinations miss smaller airports
+
+**Tell the user when the curated list might miss what they want.** If they ask "find me cheapest US→Europe" and you use `USA`, mention that it's restricted to 13 major hubs and that smaller-airport options weren't searched — let them confirm they're OK with that or ask you to expand the search.
 
 ### `get_flights` parameters
 
