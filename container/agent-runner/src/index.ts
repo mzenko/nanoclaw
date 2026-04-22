@@ -564,6 +564,26 @@ async function runQuery(
   // the matching tool_result. Keyed by the parent's Task() tool_use.id.
   const openSubagents = new Set<string>();
 
+  // Subset of openSubagents that were spawned with `run_in_background: true`.
+  // For these, the SDK returns a synchronous tool_result IMMEDIATELY (just an
+  // ack: "task started") while the subagent runs async. We must NOT emit
+  // subagent_end on that immediate tool_result — the real completion arrives
+  // later via a `system/task_notification` message. We also use this set to
+  // know whether to listen for `task_progress` messages for activity display.
+  const backgroundSubagents = new Set<string>();
+
+  // Maps SDK task_id → original parent Agent tool_use.id. Built from
+  // `system/task_started` messages so we can correlate `task_progress` /
+  // `task_notification` events back to the right subagent slot, since
+  // those messages have `tool_use_id` as optional and we can't always rely
+  // on it being present.
+  const taskIdToToolUseId = new Map<string, string>();
+
+  // Per-subagent: name of the last tool emitted via task_progress. The SDK
+  // fires task_progress every few seconds whether or not the subagent's tool
+  // changed; without dedup we'd flood the activity list with duplicates.
+  const lastProgressToolBySubagent = new Map<string, string>();
+
   // AbortController for the entire query. When the user signals stop (close
   // sentinel from the host), abort fires and the SDK exits the for-await
   // loop with a terminal 'aborted_*' subtype. The orchestrator will spawn a
@@ -667,6 +687,12 @@ async function runQuery(
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
+      // Enable per-subagent progress summaries (present-tense "Searching
+      // Aeroplan availability for SEA→HND..." text on task_progress
+      // events). Cheap — reuses the subagent's prompt cache. Used by the
+      // task_progress handler to populate background-subagent activity in
+      // the Discord embed.
+      agentProgressSummaries: true,
       mcpServers: {
         nanoclaw: {
           command: 'node',
@@ -760,6 +786,12 @@ async function runQuery(
                 ? input.description
                 : undefined) ?? 'subagent';
             openSubagents.add(block.id);
+            // Background subagents (run_in_background:true) need special
+            // handling — see backgroundSubagents declaration and the
+            // task_notification handler below.
+            if (input && input.run_in_background === true) {
+              backgroundSubagents.add(block.id);
+            }
             writeProgress({
               kind: 'subagent_begin',
               turnId,
@@ -791,6 +823,10 @@ async function runQuery(
     // Subagent end: the parent's user message contains tool_result blocks for
     // its own outstanding tool_use ids. When one matches an open subagent,
     // that subagent's work has wrapped — close its section.
+    //
+    // EXCEPT for background subagents: their immediate tool_result is just a
+    // "task started" ack. The real completion arrives later via a
+    // `system/task_notification` message (handled below).
     if (message.type === 'user') {
       const blocks = ((message as unknown as {
         message?: { content?: Array<Record<string, unknown>> };
@@ -799,13 +835,80 @@ async function runQuery(
         if (
           block.type === 'tool_result' &&
           typeof block.tool_use_id === 'string' &&
-          openSubagents.has(block.tool_use_id)
+          openSubagents.has(block.tool_use_id) &&
+          !backgroundSubagents.has(block.tool_use_id)
         ) {
           openSubagents.delete(block.tool_use_id);
           writeProgress({
             kind: 'subagent_end',
             turnId,
             subagentId: block.tool_use_id,
+          });
+        }
+      }
+    }
+
+    // Background-subagent lifecycle:
+    //
+    // - task_started: build task_id → parent_tool_use_id correlation so we
+    //   can route subsequent task_progress / task_notification events back
+    //   to the right subagent slot.
+    // - task_progress: the SDK's `agentProgressSummaries` machinery — fires
+    //   every few seconds with the subagent's current tool name + a present-
+    //   tense summary. We mirror this into a per-subagent tool_use event so
+    //   the subagent's embed shows live activity (deduped on tool name).
+    // - task_notification: real completion. Emit subagent_end for the slot.
+    if (message.type === 'system') {
+      const sysMsg = message as unknown as {
+        subtype?: string;
+        task_id?: string;
+        tool_use_id?: string;
+        description?: string;
+        last_tool_name?: string;
+        summary?: string;
+        status?: string;
+      };
+      if (sysMsg.subtype === 'task_started' && typeof sysMsg.task_id === 'string') {
+        if (typeof sysMsg.tool_use_id === 'string') {
+          taskIdToToolUseId.set(sysMsg.task_id, sysMsg.tool_use_id);
+        }
+      } else if (
+        sysMsg.subtype === 'task_progress' &&
+        typeof sysMsg.task_id === 'string'
+      ) {
+        const tuid =
+          sysMsg.tool_use_id ?? taskIdToToolUseId.get(sysMsg.task_id);
+        if (tuid && openSubagents.has(tuid) && sysMsg.last_tool_name) {
+          // Dedup: skip if last task_progress already reported the same tool.
+          const prev = lastProgressToolBySubagent.get(tuid);
+          if (prev !== sysMsg.last_tool_name) {
+            lastProgressToolBySubagent.set(tuid, sysMsg.last_tool_name);
+            writeProgress({
+              kind: 'tool_use',
+              turnId,
+              name: sysMsg.last_tool_name,
+              ...(sysMsg.summary || sysMsg.description
+                ? { summary: sysMsg.summary ?? sysMsg.description }
+                : {}),
+              subagentId: tuid,
+            });
+          }
+        }
+      } else if (
+        sysMsg.subtype === 'task_notification' &&
+        typeof sysMsg.task_id === 'string'
+      ) {
+        const tuid =
+          sysMsg.tool_use_id ?? taskIdToToolUseId.get(sysMsg.task_id);
+        if (tuid && openSubagents.has(tuid)) {
+          openSubagents.delete(tuid);
+          backgroundSubagents.delete(tuid);
+          lastProgressToolBySubagent.delete(tuid);
+          taskIdToToolUseId.delete(sysMsg.task_id);
+          writeProgress({
+            kind: 'subagent_end',
+            turnId,
+            subagentId: tuid,
           });
         }
       }
