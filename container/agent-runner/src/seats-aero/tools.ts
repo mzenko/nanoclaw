@@ -120,7 +120,9 @@ export async function getFlights(args: GetFlightsArgs): Promise<ToolResult> {
     minify_trips: args.minify_trips,
     include_filtered: args.include_filtered,
     order_by: args.order_by ?? 'lowest_mileage',
-    take: args.take,
+    // Default take to the API max (1000). Each call counts as 1 against the
+    // daily quota regardless of payload size, so smaller take saves nothing.
+    take: args.take ?? 1000,
     skip: args.skip,
     cursor: args.cursor,
   });
@@ -154,7 +156,9 @@ export async function getBulkAvail(args: GetBulkAvailArgs): Promise<ToolResult> 
     origin_region: args.originRegion,
     destination_region: args.destinationRegion,
     include_filtered: args.include_filtered,
-    take: args.take,
+    // Default take to the API max (1000). Each call counts as 1 against the
+    // daily quota regardless of payload size, so smaller take saves nothing.
+    take: args.take ?? 1000,
     skip: args.skip,
     cursor: args.cursor,
   });

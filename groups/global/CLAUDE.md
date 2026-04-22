@@ -88,17 +88,21 @@ You have `mcp__seats__*` tools for finding award flights. Data is **cached** (ma
 3. **For each, pass the row's top-level `ID` field to `get_trips`** — NOT items from the row's `AvailabilityTrips` field. Per the seats.aero docs: "you call the Get Trips API with the ID of the Availability."
 4. Summarize: program, mileage cost, taxes, flight numbers, times, aircraft. Include booking links from the `get_trips` response if present.
 
+**Skip the `get_trips` drill-down when you only need a nonstop-vs-connection price comparison.** Each `get_flights` row has per-cabin `*Direct` shortcut fields: `JDirectMileageCost(Raw)`, `JDirectRemainingSeats(Raw)`, `JDirectAirlines(Raw)`, `JDirectTotalTaxes(Raw)` (and Y/W/F variants). So if the user asks "is the nonstop more miles than the cheapest with a connection?", just compare `JMileageCostRaw` (cheapest, including connections) against `JDirectMileageCostRaw` (cheapest nonstop) on the row — no extra call needed.
+
 ### Reading trip responses (layovers, times, segments)
 
 A single `get_flights` row often expands to multiple trips when you call `get_trips` — typically a nonstop plus one or more connections, sometimes at the same mileage cost. **Don't trust `JDirect: true` and stop looking** — drill in with `get_trips` and present alternatives if a connection is materially shorter total or has better times.
 
 Each trip's response shape:
 
-- **`Stops`** — integer count of layovers. Segment count = `Stops + 1`.
 - **`AvailabilitySegments`** — array, one per leg. Sort by the segment's `Order` field (0-indexed) before walking — array order is not guaranteed.
+- **Stop count**: derive from `AvailabilitySegments.length - 1`. ⚠️ The trip-level `Stops` field has known bugs (e.g. Qantas QF4 nonstop reported as `Stops: 1`) — don't trust it as the source of truth.
 - **Layover airport** = `segments[i].DestinationAirport` (equals `segments[i+1].OriginAirport` — the API guarantees this).
-- **Layover duration**: not an explicit field. Compute as `segments[i+1].DepartsAt − segments[i].ArrivesAt`.
+- **Layover duration**: not an explicit field. Compute as `segments[i+1].DepartsAt − segments[i].ArrivesAt`. (Each segment also has its own `Duration` field in minutes if you need leg duration.)
 - **`Carriers`** — csv of operating carriers in segment order (e.g. `"CM, TK"`). The `Source` field is the redemption program; carriers can be partners.
+
+The `/trips/{id}` response also has top-level **`booking_links`** and **`carriers`** — surface the booking link to the user when present rather than telling them to navigate to the program manually.
 
 ⚠️ **Time-zone trap**: segment `DepartsAt` / `ArrivesAt` are ISO strings with a `Z` suffix that **lies**. The seats.aero docs are explicit: "all times are in airport local times." Don't convert across timezones — treat each timestamp as wall-clock-at-its-airport. This means:
 - Layover duration math works because both sides happen at the same airport (same local frame).
@@ -115,7 +119,7 @@ If the user said "no connections," either pass `only_direct_flights: true` to `g
 - **Airports**: single IATA or comma-delimited (`"JFK,EWR,LGA"` → `"NRT,HND"`).
 - **Dates**: `startDate` + `endDate` in `YYYY-MM-DD`. Single day = set them equal.
 - **`cabins`**: comma-delimited from `{economy, premium, business, first}` (e.g. `"business,first"`).
-- **`sources`**: comma-delimited program filter (e.g. `"aeroplan,united"`). Canonical list: aeroplan, alaska, american, aeromexico, azul, connectmiles, delta, emirates, ethiopian, etihad, eurobonus, finnair, flyingblue, frontier, jetblue, lufthansa, qantas, qatar, saudia, singapore, smiles, spirit, turkish, united, velocity, virginatlantic.
+- **`sources`**: comma-delimited program filter (e.g. `"aeroplan,united"`). Canonical list from the [Concepts](https://developers.seats.aero/reference/concepts-copy) doc: aeroplan, alaska, american, aeromexico, azul, connectmiles, delta, emirates, ethiopian, etihad, eurobonus, finnair, flyingblue, frontier, jetblue, lufthansa, qantas, qatar, saudia, singapore, smiles, spirit, turkish, united, velocity, virginatlantic. The list is **not exhaustive** — the API returns sources beyond it (e.g. `british` for British Airways Executive Club). Pass any source the user mentions; the API will 400 on unknown values.
 - **`carriers`**: 2-char airline codes, comma-delimited (`"DL,AA"`).
 - Default `order_by: "lowest_mileage"` unless the user specifies otherwise.
 

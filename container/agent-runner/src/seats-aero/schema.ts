@@ -78,13 +78,18 @@ export const GetFlightsSchema = {
     .boolean()
     .optional()
     .describe(
-      'Include flight-level trip details inline (slower, larger payload). ' +
-        'Usually leave false and call get_trips for the few results you care about.',
+      'Include trip-level summaries inline (FlightNumbers csv, Stops, MileageCost, ' +
+        'TotalDuration, Carriers per trip). Does NOT include AvailabilitySegments — ' +
+        'still need get_trips for segment-level data (per-leg times, aircraft, airports). ' +
+        'Usually leave false; call get_trips for the few results you care about.',
     ),
   minify_trips: z
     .boolean()
     .optional()
-    .describe('Reduce trip payload size. Only meaningful with include_trips=true.'),
+    .describe(
+      'Reduce trip payload size by ~56% (drops most metadata). Only meaningful with ' +
+        'include_trips=true.',
+    ),
   include_filtered: z
     .boolean()
     .optional()
@@ -103,7 +108,12 @@ export const GetFlightsSchema = {
     .min(10)
     .max(1000)
     .optional()
-    .describe('Page size (10-1000). Default 500.'),
+    .describe(
+      'Page size (10-1000). MCP defaults this to 1000 (the max) because each call ' +
+        'counts as 1 against the daily quota regardless of response size, so taking fewer ' +
+        'rows saves nothing. Lower only for broad searches where you only care about the ' +
+        'top N cheapest — results are already sorted by lowest_mileage.',
+    ),
   skip: z
     .number()
     .int()
@@ -144,7 +154,12 @@ export const GetBulkAvailSchema = {
     .min(10)
     .max(1000)
     .optional()
-    .describe('Page size (10-1000). Default 500.'),
+    .describe(
+      'Page size (10-1000). MCP defaults this to 1000 (the max) because each call ' +
+        'counts as 1 against the daily quota regardless of response size, so taking fewer ' +
+        'rows saves nothing. Lower only for broad searches where you only care about the ' +
+        'top N cheapest — results are already sorted by lowest_mileage.',
+    ),
   skip: z
     .number()
     .int()
