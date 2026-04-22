@@ -88,6 +88,28 @@ You have `mcp__seats__*` tools for finding award flights. Data is **cached** (ma
 3. **For each, pass the row's top-level `ID` field to `get_trips`** — NOT items from the row's `AvailabilityTrips` field. Per the seats.aero docs: "you call the Get Trips API with the ID of the Availability."
 4. Summarize: program, mileage cost, taxes, flight numbers, times, aircraft. Include booking links from the `get_trips` response if present.
 
+### Reading trip responses (layovers, times, segments)
+
+A single `get_flights` row often expands to multiple trips when you call `get_trips` — typically a nonstop plus one or more connections, sometimes at the same mileage cost. **Don't trust `JDirect: true` and stop looking** — drill in with `get_trips` and present alternatives if a connection is materially shorter total or has better times.
+
+Each trip's response shape:
+
+- **`Stops`** — integer count of layovers. Segment count = `Stops + 1`.
+- **`AvailabilitySegments`** — array, one per leg. Sort by the segment's `Order` field (0-indexed) before walking — array order is not guaranteed.
+- **Layover airport** = `segments[i].DestinationAirport` (equals `segments[i+1].OriginAirport` — the API guarantees this).
+- **Layover duration**: not an explicit field. Compute as `segments[i+1].DepartsAt − segments[i].ArrivesAt`.
+- **`Carriers`** — csv of operating carriers in segment order (e.g. `"CM, TK"`). The `Source` field is the redemption program; carriers can be partners.
+
+⚠️ **Time-zone trap**: segment `DepartsAt` / `ArrivesAt` are ISO strings with a `Z` suffix that **lies**. The seats.aero docs are explicit: "all times are in airport local times." Don't convert across timezones — treat each timestamp as wall-clock-at-its-airport. This means:
+- Layover duration math works because both sides happen at the same airport (same local frame).
+- Total duration from first `DepartsAt` to last `ArrivesAt` is **not reliable** as a wall-clock subtraction across timezones — use the trip-level `TotalDuration` field (in minutes) instead.
+
+**Surface connection warnings to the user when applicable**:
+- International layovers under ~60 minutes are tight.
+- The API doesn't flag terminal changes, separate tickets, or visa transit requirements — if a connection looks aggressive, mention that the user should verify the connection is bookable as a single ticket on the airline's site.
+
+If the user said "no connections," either pass `only_direct_flights: true` to `get_flights` (filters at the API), or drill in and filter trips to `Stops === 0`. The first is cheaper if you know up-front.
+
 ### `get_flights` parameters
 
 - **Airports**: single IATA or comma-delimited (`"JFK,EWR,LGA"` → `"NRT,HND"`).
