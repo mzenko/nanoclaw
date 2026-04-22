@@ -116,24 +116,71 @@ If the user said "no connections," either pass `only_direct_flights: true` to `g
 
 ### Multi-city codes (powerful for broad searches)
 
-The seats.aero API accepts special **3-letter multi-city codes** that expand server-side to lists of airports. Use these instead of long comma-delimited lists, especially for exploratory searches across regions or airline networks. **One call with `USA → EUR` returns availability across 13 US origins × 24 EU destinations × ~19 mileage programs.**
+The seats.aero API accepts special **multi-character codes** that expand server-side to lists of airports. Use these instead of long comma-delimited lists, especially for exploratory searches across regions or airline networks. **One call with `USA → EUR` returns availability across 13 US origins × 24 EU destinations × ~19 mileage programs.**
 
-Common codes:
+Source: https://docs.seats.aero/article/73-searching-multiple-airports-or-cities-at-once
 
-| Type | Examples |
-|---|---|
-| Metro areas | `NYC` (JFK,LGA,EWR), `LON` (LHR,LGW,LCY,STN,LTN), `TYO` (HND,NRT), `PAR` (CDG,ORY), `WAS` (IAD,DCA,BWI), `CHI` (ORD,MDW), `SAO`, `RIO`, `SEL`, `OSA`, `BJS` |
-| US regions | `EST` (East Coast), `WST` (West Coast), `CAL` (California), `MIW` (Midwest), `QBA` (Bay Area), `QLA` (LA metro), `QMI` (Miami metro), `HAW` |
-| Continents/regions | `USA`, `EUR`, `ASA` (Asia large), `SAS` (Southeast Asia), `MEA` (Middle East), `CAR` (Caribbean), `CAM` (Central America), `SAM` (South America), `LAM` (Latin America), `QAF` (Africa), `ANZ` (Australia+NZ), `SCH` (Schengen), `INDIA`, `CNA` (mainland China), `JPN`, `BRL` (Brazil) |
-| Country | `CAD` (Canada), `MXC` (Mexico), `GER`, `UKD` |
-| **Airline hubs** | `UAH` (United), `AAH` (American), `DLL` (Delta) — use these when the user mentions a specific carrier's network |
+Full code → airport mappings (use this table to answer "what does code X include?" or "is airport Y in code Z?"):
+
+**Metro areas:**
+- `NYC` → JFK, LGA, EWR
+- `LON` → LGW, LHR, LCY, STN, LTN
+- `WAS` → IAD, DCA, BWI
+- `CHI` → ORD, MDW
+- `PAR` → CDG, ORY
+- `TYO` → HND, NRT
+- `OSA` → KIX, ITM
+- `SEL` → ICN, GMP
+- `BJS` → PEK, PKX
+- `SAO` → GRU, CGH, VCP
+- `RIO` → GIG, SDU
+- `YTO` → YYZ, YTZ
+
+**US regions:**
+- `EST` (East Coast) → JFK, LGA, EWR, BOS, PHL, PIT, IAD, DCA, CLT
+- `WST` (West Coast — note: includes mountain-time hubs) → LAX, SFO, SJC, SEA, SAN, PDX, DEN, YVR, LAS, SLC, PHX
+- `CAL` (California) → LAX, SFO, SJC, SAN, OAK, SMF
+- `MIW` (Midwest) → ORD, MDW, DTW, CLE, CVG, IND, MSP
+- `QBA` (Bay Area) → SFO, SJC, OAK
+- `QLA` (LA metro) → LAX, BUR, SNA, ONT, LGB
+- `QMI` (Miami metro) → MIA, FLL, PBI
+- `HAW` (Hawaii) → HNL, OGG, KOA, LIH
+
+**Continents and large regions:**
+- `USA` → SFO, LAX, JFK, EWR, ORD, ATL, IAD, IAH, DEN, MIA, SEA, DFW, BOS
+- `EUR` → AMS, ATH, BCN, BER, CDG, DUB, FRA, IST, LHR, MUC, MAD, FCO, MXP, ZRH, HEL, ARN, WAW, BRU, LGW, CPH, LIS, VIE, GVA, EDI
+- `SCH` (Schengen) → AMS, ATH, BCN, BER, CDG, FRA, MUC, MAD, FCO, MXP, ZRH, HEL, ARN, WAW, BRU, CPH, LIS, VIE, GVA, PMI, TFS, NCE, DBV, AGP
+- `ASA` (Asia large) → HND, NRT, SIN, BKK, ICN, HKG, KUL, TPE, PVG, PEK, PKX
+- `SAS` (Southeast Asia) → SIN, KUL, BKK, SGN, HAN, MNL, CGK, DPS
+- `MEA` (Middle East) → DXB, AUH, DOH
+- `CAR` (Caribbean) → CUR, AUA, BON, AXA, ANU, STT, STX, BGI, HAV, PUJ, SDQ, MBJ, SJU, SXM
+- `CAM` (Central America) → BZE, GUA, FRS, SAL, SAP, RTB, TGU, LCE, MGA, SJO, LIR, PTY, DAV, BLB
+- `SAM` (South America) → EZE, AEP, COR, MDZ, SCL, IPC, LIM, CUZ, BOG, MDE, CTG, UIO, GYE, GIG, GRU, BSB, SSA, REC, FOR, POA, FLN, ASU, MVD, CCS, VVI, LPB, SRE, GEO, PBM, CAY
+- `LAM` (Latin America = SAM + CAM + Mexico/Caribbean) → ~70 airports across the region
+- `QAF` (Africa) → CAI, CMN, ADD, JNB, CPT, NBO, JRO, HLE, ZNZ
+- `ANZ` (Australia + NZ) → SYD, MEL, BNE, PER, AKL, ADL
+- `AUL` (Australia only) → SYD, MEL, BNE, PER, ADL
+
+**Country:**
+- `CAD` (Canada) → YYZ, YUL, YVR, YYC, YEG, YOW, YHZ, YWG, YQB, YQR, YXE
+- `MXC` (Mexico) → MEX, CUN, GDL, MTY, SJD, PVR
+- `GER` (Germany) → MUC, FRA, BER
+- `UKD` (UK) → LHR, LGW, EDI, MAN
+- `JPN` (Japan) → HND, NRT, KIX, ITM
+- `INDIA` (note: 5 chars, not 3) → BOM, DEL, HYD, BLR, MAA, COK, CCU, AMD, TRV
+- `CNA` (mainland China) → PEK, PKX, PVG, CAN, SZX, CKG, TFU
+- `BRL` (Brazil — large airport set) → GRU, GIG, CNF, BSB, CGH, SSA, REC, POA, FLN, CWB, FOR, MAO, BEL, VCP, SDU, NAT, SLZ, MCZ, AJU, JPA, IGU, THE, GYN, CPV, PVH, RBR, JDO, UDI, SJP, CGR, IOS, PMW, CXJ, STM, MAB
+
+**Airline hubs (use when user mentions a specific carrier):**
+- `UAH` (United hubs) → DEN, LAX, SFO, ORD, IAD, EWR, IAH
+- `AAH` (American hubs) → MIA, DFW, PHX, CLT, PHL, JFK, ORD
+- `DLL` (Delta hubs) → ATL, DTW, MSP, SLC, SEA, LAX, JFK, BOS
 
 **When to use them:**
 - Broad exploration: "what's available from anywhere in the US to Europe in July?" → `originAirport: "USA", destinationAirport: "EUR"` (one call)
 - "What does United have out of any of its hubs to Asia?" → `originAirport: "UAH", destinationAirport: "ASA", sources: "united"` (one call)
 - Metro-area queries: "flying to/from NYC" → `NYC` is shorter than `JFK,LGA,EWR` and the API guarantees the same expansion
-
-The full list is at https://docs.seats.aero/article/multi-city-codes — there are ~40 codes; the table above covers the highest-value ones.
+- When the user names an airport, you can tell them which codes contain it by scanning this table.
 
 ### `get_flights` parameters
 
