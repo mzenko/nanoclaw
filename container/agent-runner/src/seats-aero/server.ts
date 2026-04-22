@@ -5,11 +5,19 @@
  * Reads SEATS_API_KEY from env (host passes it via -e at container spawn,
  * agent-runner deletes it from process.env after capturing for this server's
  * env, so Bash subprocesses can't echo it).
+ *
+ * Server-level guidance is provided three ways:
+ *   1. `instructions` (≤2048 chars, hard cap in the SDK) — essential
+ *      gotchas/workflow surfaced into the system prompt automatically.
+ *   2. Resources at seats-aero://* — bulky reference material the agent
+ *      reads on demand (multi-city codes, sources list).
+ *   3. Per-tool descriptions — narrow guidance specific to one tool.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
+import { MULTI_CITY_CODES, SOURCES_REFERENCE } from './reference.js';
 import {
   GetBulkAvailSchema,
   GetFlightsSchema,
@@ -27,65 +35,117 @@ import {
   getTrips,
 } from './tools.js';
 
-const server = new McpServer({
-  name: 'seats-aero',
-  version: '1.0.0',
-});
+// Server-level instructions. Surfaced into the agent's system prompt by
+// the SDK's MCP client. Hard cap = 2048 chars (anything longer gets
+// truncated). Keep this as the essential operating manual; push detail
+// into resources or tool descriptions.
+const INSTRUCTIONS = `Award-flight search via seats.aero (mileage/points, NOT cash).
 
-// Tool descriptions quote the official endpoint-selection guidance from
-// https://developers.seats.aero/reference/concepts-copy where available,
-// and add operational hints (multi-airport syntax, the search→trips
-// drill-down) where the docs are silent. All four endpoints count
-// 1-for-1 against the same 1,000/day Pro quota.
+ENDPOINTS:
+- get_flights (Cached Search) — default for "find flights X→Y on date Z".
+- get_trips — drill into a get_flights row by passing the row's TOP-LEVEL \`ID\` field (NOT items from its AvailabilityTrips field). Returns flight numbers, segments, times, aircraft, and top-level booking_links.
+- get_bulk_avail — only for "what does program X have available" queries. Large payloads.
+- get_routes — rare; "what routes does program X fly".
+
+WORKFLOW: get_flights → pick top 1-3 cheapest rows → get_trips on each row's ID → summarize. Always tell user to verify on the airline site before booking.
+
+QUOTA: 1000 calls/day, midnight-UTC reset. \`X-RateLimit-Remaining\` in every response. Calls count by NUMBER, not size — default take=1000.
+
+DATA-QUALITY GOTCHAS:
+- \`Stops\` field is buggy (saw Qantas QF4 nonstop reported as Stops:1). Always derive: stops = AvailabilitySegments.length - 1.
+- Segment times are airport-LOCAL despite the Z suffix — don't convert across timezones. Use trip-level \`TotalDuration\` (minutes) for total time.
+- include_trips=true returns trip summaries only, NOT segments. Still need get_trips for per-leg detail.
+- Sort segments by their \`Order\` field, not array order.
+- get_flights rows have *Direct fields (e.g. JDirectMileageCost) that give nonstop-only metrics — use these to answer "is the nonstop more miles than cheapest with connection?" without an extra get_trips call.
+
+PROGRAM QUIRKS: qatar/turkish/singapore = no taxes returned. qantas/emirates/connectmiles/azul/american (mostly) = no seat counts. eurobonus = economy + business only.
+
+MULTI-CITY CODES: airport fields accept seats.aero 3-letter codes (NYC, LON, USA, EUR, UAH, etc.). Codes are CURATED ("Large Airports") lists, NOT exhaustive. Read seats-aero://codes/multi-city for the full table.
+
+SOURCES: free string; pass any user-mentioned program. Read seats-aero://sources for the canonical list with cabin support and quirks.
+
+Live Search not available on Pro tier.`;
+
+const server = new McpServer(
+  {
+    name: 'seats-aero',
+    version: '1.0.0',
+  },
+  {
+    instructions: INSTRUCTIONS,
+  },
+);
+
+// --- Resources ----------------------------------------------------
+
+server.registerResource(
+  'multi-city-codes',
+  'seats-aero://codes/multi-city',
+  {
+    title: 'seats.aero multi-city codes (full mappings)',
+    description:
+      'Complete table of 3-letter codes (NYC, LON, USA, EUR, UAH, etc.) and ' +
+      'the airports each one expands to. Read this when the user asks "what ' +
+      'does code X include?" or "is airport Y in code Z?".',
+    mimeType: 'text/markdown',
+  },
+  async (uri) => ({
+    contents: [{ uri: uri.href, mimeType: 'text/markdown', text: MULTI_CITY_CODES }],
+  }),
+);
+
+server.registerResource(
+  'sources',
+  'seats-aero://sources',
+  {
+    title: 'seats.aero canonical mileage program sources',
+    description:
+      'Table of the 26 documented mileage programs accepted as `source` / ' +
+      '`sources` parameters, with cabin support (Y/W/J/F), seat-count and ' +
+      'trip-data availability per program. List is not exhaustive — pass any ' +
+      'user-mentioned program; the API 400s on unknown values.',
+    mimeType: 'text/markdown',
+  },
+  async (uri) => ({
+    contents: [{ uri: uri.href, mimeType: 'text/markdown', text: SOURCES_REFERENCE }],
+  }),
+);
+
+// --- Tools --------------------------------------------------------
+//
+// Tool descriptions stay narrow — server-level workflow/gotchas live in
+// `instructions` above, bulky reference data in resources.
 
 server.tool(
   'get_flights',
-  // Quoted from Concepts: "Cached Search is the most common endpoint... allows you
-  // to search for availability between specific airports within specific date ranges
-  // across all mileage programs."
-  'Cached Search — the most common endpoint. Searches cached award availability ' +
-    'between specific airports within specific date ranges, across all mileage programs. ' +
-    'originAirport and destinationAirport accept a single IATA code or a comma-delimited ' +
-    'list ("JFK,EWR" → "NRT,HND"). cabins is comma-delimited ("business,first"). sources ' +
-    'restricts to specific mileage programs ("aeroplan,united"). Each row\'s top-level "ID" ' +
-    'field is the Availability summary ID — pass it to get_trips for flight-level details ' +
-    '(flight numbers, segments, times). Data is cached, so always tell the user to confirm ' +
-    'on the airline site before booking.',
+  'Cached Search: cached award availability between airports on date(s). ' +
+    'See server instructions for workflow + multi-city codes.',
   GetFlightsSchema,
   async (args) => getFlights(args as GetFlightsArgs),
 );
 
 server.tool(
   'get_trips',
-  // Quoted from Concepts: "you call the Get Trips API with the ID of the Availability"
-  'Get Trips — drills into a summary Availability object. Per the seats.aero docs, ' +
-    '"you call the Get Trips API with the ID of the Availability" — pass the top-level "ID" ' +
-    'field of a get_flights row (NOT items from its AvailabilityTrips field). The response ' +
-    'contains all individual trips for that Availability, with flight numbers, segments, ' +
-    'departure/arrival times, aircraft, mileage cost, taxes, remaining seats, and booking links.',
+  "Get Trips: pass the top-level `ID` of a get_flights row to get its trips " +
+    '(flight numbers, segments, times, aircraft, booking links).',
   GetTripsSchema,
   async (args) => getTrips(args as GetTripsArgs),
 );
 
 server.tool(
   'get_bulk_avail',
-  // Quoted from Concepts: "Bulk Availability... allows you to retrieve a large amount of
-  // availability for one specific mileage program... when many results are required."
-  'Bulk Availability — for "many results" use cases. Retrieves a large amount of cached ' +
-    'availability for one specific mileage program, optionally narrowed by cabin, date range, ' +
-    'or origin/destination region. Region values are exactly: "North America", "South America", ' +
-    '"Africa", "Asia", "Europe", "Oceania". Use this for program-wide browsing (e.g. "all ' +
-    'availability from North America to Europe on Delta SkyMiles") rather than for known ' +
-    'origin/destination searches — those go through get_flights.',
+  'Bulk Availability: cached availability for one mileage program, optionally ' +
+    'narrowed by cabin/dates/region. Region values: "North America", "South ' +
+    'America", "Africa", "Asia", "Europe", "Oceania". Use for program-wide ' +
+    'browsing; for known origin/destination searches use get_flights.',
   GetBulkAvailSchema,
   async (args) => getBulkAvail(args as GetBulkAvailArgs),
 );
 
 server.tool(
   'get_routes',
-  'Get Routes — returns the list of routes a single mileage program flies. Useful when ' +
-    'the user asks "what does <program> fly" or you need to confirm an origin/destination ' +
-    'is even in a program\'s network before searching availability.',
+  "Get Routes: list the routes a single program flies. Useful for \"what does " +
+    'X fly\" or to confirm an origin/destination is in the network.',
   GetRoutesSchema,
   async (args) => getRoutes(args as GetRoutesArgs),
 );
