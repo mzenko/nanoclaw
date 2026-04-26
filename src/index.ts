@@ -10,7 +10,9 @@ import { DATA_DIR } from './config.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
+import { markAllContainersStopped } from './db/sessions.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { ensureSidecars } from './sidecars.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
@@ -70,6 +72,12 @@ async function main(): Promise<void> {
   // 2. Container runtime
   ensureContainerRuntimeRunning();
   cleanupOrphans();
+  markAllContainersStopped();
+
+  // 2b. Sidecar HTTP MCPs. Each script
+  // is idempotent — no-op if already running on the latest image. Skipped
+  // silently when required .env vars are missing.
+  ensureSidecars(process.cwd());
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
@@ -146,6 +154,23 @@ async function main(): Promise<void> {
     async setTyping(channelType: string, platformId: string, threadId: string | null): Promise<void> {
       const adapter = getChannelAdapter(channelType);
       await adapter?.setTyping?.(platformId, threadId);
+    },
+    async progress(
+      channelType: string,
+      hostSessionId: string,
+      platformId: string,
+      threadId: string | null,
+      content: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapter(channelType);
+      if (!adapter?.progress) return;
+      try {
+        const event = JSON.parse(content);
+        await adapter.progress(hostSessionId, platformId, threadId, event);
+      } catch (err) {
+        // Malformed progress row shouldn't be replayed forever — drop it.
+        log.warn('Progress event invalid JSON; dropping', { channelType, err });
+      }
     },
   };
   setDeliveryAdapter(deliveryAdapter);

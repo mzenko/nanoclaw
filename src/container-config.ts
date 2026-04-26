@@ -14,15 +14,38 @@ import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
 
-export interface McpServerConfig {
+/**
+ * Stdio MCP server — runs as a subprocess of the agent-runner, communicating
+ * over stdin/stdout. Most NanoClaw MCPs are this shape.
+ */
+export interface StdioMcpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
-  // Optional always-in-context guidance. When set, the host writes the
-  // content to `.claude-fragments/mcp-<name>.md` at spawn and imports it
-  // into the composed CLAUDE.md.
+  /** Optional always-in-context guidance. See note on McpServerConfig. */
   instructions?: string;
 }
+
+/**
+ * Remote HTTP MCP server — the SDK speaks JSON-RPC to a streamable-HTTP
+ * endpoint. Used for hosted MCPs (Kiwi, GitHub, etc.) and sidecar MCPs that
+ * expose themselves over HTTP rather than stdio.
+ */
+export interface HttpMcpServerConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+  /** Optional always-in-context guidance. See note on McpServerConfig. */
+  instructions?: string;
+}
+
+/**
+ * Discriminated union: stdio (no `type`) or HTTP (`type: 'http'`).
+ * The host writes the optional `instructions` field to
+ * `.claude-fragments/mcp-<name>.md` at spawn and imports it into the
+ * composed CLAUDE.md.
+ */
+export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig;
 
 export interface AdditionalMountConfig {
   hostPath: string;

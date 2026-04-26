@@ -23,11 +23,19 @@ import { readContainerConfig, writeContainerConfig } from './container-config.js
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { readEnvFile } from './env.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import {
+  isSidecarEnabled,
+  SIDECAR_NETWORK_NAME,
+  SIDECAR_NO_PROXY_HOSTS,
+  SIDECARS,
+  sidecarEnvKeys,
+} from './sidecar-registry.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -46,6 +54,61 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
+
+/**
+ * Read a sidecar bearer token from `data/sidecar-tokens/<name>.token`.
+ * Each sidecar's `start.sh` writes the token there at first launch (mode
+ * 0600). Returns empty string when the file is missing — caller treats that
+ * as "sidecar not wired" and skips the env passthrough + network attach.
+ */
+function readSidecarToken(tokenFile: string): string {
+  const p = path.join(process.cwd(), 'data', 'sidecar-tokens', tokenFile);
+  try {
+    return fs.readFileSync(p, 'utf-8').trim();
+  } catch {
+    return '';
+  }
+}
+
+export interface SidecarContainerArgs {
+  envArgs: string[];
+  networkName?: string;
+  noProxyHosts: string[];
+}
+
+export function buildSidecarContainerArgs(
+  env: Record<string, string>,
+  readToken: (tokenFile: string) => string = readSidecarToken,
+): SidecarContainerArgs {
+  const sidecarTokens = SIDECARS.filter((sidecar) => isSidecarEnabled(sidecar, env)).map((sidecar) => ({
+    sidecar,
+    token: readToken(sidecar.tokenFile),
+  }));
+  const envArgs = sidecarTokens.flatMap(({ sidecar, token }) => (token ? ['-e', `${sidecar.tokenEnv}=${token}`] : []));
+  const hasToken = sidecarTokens.some(({ token }) => token);
+  return {
+    envArgs,
+    networkName: hasToken ? SIDECAR_NETWORK_NAME : undefined,
+    noProxyHosts: hasToken ? [...SIDECAR_NO_PROXY_HOSTS, 'localhost', '127.0.0.1'] : [],
+  };
+}
+
+export function mergeDockerEnv(args: string[], key: string, values: string[]): void {
+  const merged = new Set<string>();
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] !== '-e' || !args[i + 1].startsWith(`${key}=`)) continue;
+    for (const value of args[i + 1].slice(key.length + 1).split(',')) {
+      const trimmed = value.trim();
+      if (trimmed) merged.add(trimmed);
+    }
+    args.splice(i, 2);
+    i -= 1;
+  }
+  for (const value of values) {
+    if (value) merged.add(value);
+  }
+  if (merged.size > 0) args.push('-e', `${key}=${[...merged].join(',')}`);
+}
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
@@ -427,6 +490,25 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Chesterbot stdio MCP credentials. seats.aero uses a non-standard
+  // `Partner-Authorization` header that OneCLI's proxy can't rewrite, so
+  // the key has to ride in container env. The agent-runner captures and
+  // immediately scrubs this from process.env (M7 pattern) before any
+  // bash subprocess can echo it.
+  // Read from .env via readEnvFile rather than process.env — pnpm run dev
+  // doesn't auto-source .env into the host process.
+  const chesterEnv = readEnvFile(['SEATS_API_KEY']);
+  if (chesterEnv.SEATS_API_KEY) {
+    args.push('-e', `SEATS_API_KEY=${chesterEnv.SEATS_API_KEY}`);
+  }
+  // HTTP sidecar bearer tokens live in their own mode-0600 files under
+  // data/sidecar-tokens/ so they aren't smeared across .env. Each sidecar's
+  // start.sh writes the token there at first launch; we read the same path
+  // here. Container-side claude.ts only registers the corresponding
+  // mcpServers entry when its token is present.
+  const sidecarArgs = buildSidecarContainerArgs(readEnvFile(sidecarEnvKeys()));
+  args.push(...sidecarArgs.envArgs);
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
@@ -452,6 +534,19 @@ async function buildContainerArgs(
 
   // Host gateway
   args.push(...hostGatewayArgs());
+
+  // Attach to the shared `nanoclaw` docker network so the agent can resolve
+  // sidecar hostnames (ha-mcp, workspace-mcp). The network is created at
+  // host boot by ensureSidecars(); this only attaches when any sidecar
+  // token is present (i.e. user has actually wired one up).
+  // Also bypass the OneCLI HTTPS_PROXY for those hostnames — without NO_PROXY
+  // the SDK's HTTP MCP client tunnels http://ha-mcp:8000 through OneCLI, which
+  // can't forward to a docker-network hostname and silently drops the connection.
+  if (sidecarArgs.networkName) {
+    args.push('--network', sidecarArgs.networkName);
+    mergeDockerEnv(args, 'NO_PROXY', sidecarArgs.noProxyHosts);
+    mergeDockerEnv(args, 'no_proxy', sidecarArgs.noProxyHosts);
+  }
 
   // User mapping
   const hostUid = process.getuid?.();

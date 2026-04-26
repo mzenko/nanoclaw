@@ -71,19 +71,73 @@ async function main(): Promise<void> {
   // MCP server path — bun runs TS directly; no tsc build step in-image.
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
+  const seatsMcpPath = path.join(__dirname, 'seats-aero', 'server.ts');
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
+  // Capture-and-scrub seats.aero key so the agent's bash subprocesses can't
+  // echo it. seats.aero uses a non-standard `Partner-Authorization` header
+  // that OneCLI's MITM model can't proxy cleanly, so the key has to live in
+  // the MCP subprocess env directly.
+  const seatsApiKey = process.env.SEATS_API_KEY ?? '';
+  delete process.env.SEATS_API_KEY;
+
+  // Build MCP servers config: nanoclaw built-in + always-on Chesterbot MCPs +
+  // any from container.json.
+  type StdioMcp = { command: string; args: string[]; env: Record<string, string> };
+  type HttpMcp = { type: 'http'; url: string; headers?: Record<string, string> };
+  const mcpServers: Record<string, StdioMcp | HttpMcp> = {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
       env: {},
     },
+    // Kiwi.com cash-flight search via their hosted remote MCP. No auth.
+    'kiwi-flights': {
+      type: 'http',
+      url: 'https://mcp.kiwi.com',
+    },
   };
+  // seats.aero (award flight search). Skipped silently when no key — the MCP
+  // subprocess would just fail every call with "SEATS_API_KEY not set".
+  if (seatsApiKey) {
+    mcpServers.seatsaero = {
+      command: 'bun',
+      args: ['run', seatsMcpPath],
+      env: { SEATS_API_KEY: seatsApiKey },
+    };
+  }
+
+  // Long-running HTTP MCP sidecars on the shared `nanoclaw` docker network.
+  // Each is gated on its bearer token being present — when the host hasn't
+  // started the sidecar (missing creds, docker down) the agent simply lacks
+  // those tools. URL is overridable for tests / non-default sidecar names.
+  const haToken = process.env.HA_MCP_TOKEN ?? '';
+  if (haToken) {
+    mcpServers.homeassistant = {
+      type: 'http',
+      url: process.env.HA_MCP_URL ?? 'http://ha-mcp:8000/mcp',
+      headers: { Authorization: `Bearer ${haToken}` },
+    };
+  }
+  const workspaceToken = process.env.WORKSPACE_MCP_TOKEN ?? '';
+  if (workspaceToken) {
+    mcpServers.workspace = {
+      type: 'http',
+      url: process.env.WORKSPACE_MCP_URL ?? 'http://workspace-mcp:8000/mcp',
+      headers: { Authorization: `Bearer ${workspaceToken}` },
+    };
+  }
+  const playwrightToken = process.env.PLAYWRIGHT_MCP_TOKEN ?? '';
+  if (playwrightToken) {
+    mcpServers.playwright = {
+      type: 'http',
+      url: process.env.PLAYWRIGHT_MCP_URL ?? 'http://playwright-mcp:8000/mcp',
+      headers: { Authorization: `Bearer ${playwrightToken}` },
+    };
+  }
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
     mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
+    log(`Additional MCP server: ${name} (${'type' in serverConfig ? serverConfig.type : serverConfig.command})`);
   }
 
   const provider = createProvider(providerName, {
