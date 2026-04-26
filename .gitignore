@@ -38,4 +38,8 @@ groups/*
 # Skills system (local per-installation state)
 .nanoclaw/
 
+# Codex local state
+.codex/
+.codex
+
 agents-sdk-docs
