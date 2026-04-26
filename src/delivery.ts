@@ -59,6 +59,19 @@ export interface ChannelDeliveryAdapter {
     files?: OutboundFile[],
   ): Promise<string | undefined>;
   setTyping?(channelType: string, platformId: string, threadId: string | null): Promise<void>;
+  /**
+   * Forward a structured progress event to the channel's progress renderer
+   * (e.g. Discord embed). Adapters lacking a renderer drop the event silently.
+   * Best-effort, not retried — if the embed update fails, normal message
+   * delivery still works.
+   */
+  progress?(
+    channelType: string,
+    hostSessionId: string,
+    platformId: string,
+    threadId: string | null,
+    content: string,
+  ): Promise<void>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -245,6 +258,22 @@ async function deliverMessage(
 ): Promise<string | undefined> {
   if (!deliveryAdapter) {
     log.warn('No delivery adapter configured, dropping message', { id: msg.id });
+    return;
+  }
+
+  // Progress events — best-effort, skip the parse + permission flow + retry
+  // budget that normal messages use. Channels without a progress renderer
+  // (everything but Discord today) get a no-op via the optional method.
+  if (msg.kind === 'progress') {
+    if (deliveryAdapter.progress && msg.channel_type && msg.platform_id) {
+      try {
+        await deliveryAdapter.progress(msg.channel_type, session.id, msg.platform_id, msg.thread_id, msg.content);
+      } catch (err) {
+        // Don't escalate progress failures into the normal retry path —
+        // missing one update is fine, blocking real replies isn't.
+        log.warn('Progress dispatch failed', { id: msg.id, err });
+      }
+    }
     return;
   }
 

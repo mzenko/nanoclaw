@@ -1,7 +1,7 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { touchHeartbeat, clearStaleProcessingAcks, getInboundDb } from './db/connection.js';
 import {
   clearContinuation,
   migrateLegacyContinuation,
@@ -61,10 +61,22 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
 
+  // Drop any cancel rows that were written before this container started —
+  // they were targeting an earlier turn that's already over. Without this,
+  // a stale cancel would abort the next legitimate turn the moment it began.
+  clearStalePendingCancels();
+
   let pollCount = 0;
   while (true) {
-    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages().filter((m) => m.kind !== 'system');
+    // Skip system messages (MCP tool responses) and cancel signals (handled
+    // only mid-query — outside of one they're a no-op and get marked complete
+    // here so they don't pile up).
+    const allPending = getPendingMessages();
+    const staleCancels = allPending.filter((m) => m.kind === 'cancel');
+    if (staleCancels.length > 0) {
+      markCompleted(staleCancels.map((m) => m.id));
+    }
+    const messages = allPending.filter((m) => m.kind !== 'system' && m.kind !== 'cancel');
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -263,15 +275,31 @@ async function processQuery(
   const pollHandle = setInterval(() => {
     if (done) return;
 
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
+    // Skip system messages (MCP tool responses), /clear (needs fresh query),
+    // and cancel rows (handled separately below — they don't go to the agent).
     // Thread routing is the router's concern — if a message landed in this
     // session, the agent should see it. Per-thread sessions already isolate
     // threads into separate containers; shared sessions intentionally merge
     // everything. Filtering on thread_id here caused deadlocks when the
     // initial batch and follow-ups had mismatched thread_ids (e.g. a
     // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => {
+    const pending = getPendingMessages();
+
+    // Cancel signal: abort the active query and exit early. The provider
+    // yields a final 'progress: end, cancelled' event when aborted, which
+    // the host renders as 🚫 Cancelled. Mark completed so the cancel row
+    // doesn't bleed into a follow-up turn.
+    const cancelRows = pending.filter((m) => m.kind === 'cancel');
+    if (cancelRows.length > 0) {
+      markCompleted(cancelRows.map((m) => m.id));
+      log(`Cancel signal received (${cancelRows.length} row(s)) — aborting query`);
+      query.abort();
+      return;
+    }
+
+    const newMessages = pending.filter((m) => {
       if (m.kind === 'system') return false;
+      if (m.kind === 'cancel') return false;
       if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
       return true;
     });
@@ -322,7 +350,7 @@ async function processQuery(
   return { continuation: queryContinuation };
 }
 
-function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
+function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
   switch (event.type) {
     case 'init':
       log(`Session: ${event.continuation}`);
@@ -333,9 +361,31 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
     case 'error':
       log(`Error: ${event.message} (retryable: ${event.retryable}${event.classification ? `, ${event.classification}` : ''})`);
       break;
-    case 'progress':
-      log(`Progress: ${event.message}`);
+    case 'progress': {
+      // Surface to outbound.db as kind='progress' for the channel renderer
+      // (Discord progress embed). Channels without a progress renderer drop
+      // these silently in the host delivery dispatch.
+      const sub = 'subagentId' in event.event && event.event.subagentId ? ` (subagent ${event.event.subagentId.slice(0, 8)}…)` : '';
+      log(`Progress: ${event.event.type}${sub}`);
+      // Only emit when we have a routing target — otherwise the host can't
+      // map this back to a Discord channel.
+      if (routing.platformId && routing.channelType) {
+        try {
+          writeMessageOut({
+            id: `prog-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            kind: 'progress',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify(event.event),
+          });
+        } catch (err) {
+          // Don't let a progress-write failure crash the agent loop.
+          log(`Progress write failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       break;
+    }
   }
 }
 
@@ -434,4 +484,19 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Mark every pending cancel row in inbound.db as completed via
+ * processing_ack. Called once at container startup so a cancel that arrived
+ * after the previous container exited (and before this one started) cannot
+ * abort the first turn this container handles.
+ */
+function clearStalePendingCancels(): void {
+  const inbound = getInboundDb();
+  const stale = inbound
+    .prepare("SELECT id FROM messages_in WHERE kind = 'cancel' AND status = 'pending'")
+    .all() as Array<{ id: string }>;
+  if (stale.length === 0) return;
+  markCompleted(stale.map((r) => r.id));
 }

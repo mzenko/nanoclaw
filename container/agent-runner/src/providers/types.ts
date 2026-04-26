@@ -49,11 +49,22 @@ export interface QueryInput {
   };
 }
 
-export interface McpServerConfig {
+/** Stdio MCP server: subprocess on stdin/stdout. */
+export interface StdioMcpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
 }
+
+/** Remote HTTP MCP server: streamable-HTTP JSON-RPC. */
+export interface HttpMcpServerConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+/** Discriminated union: stdio (no `type`) or HTTP (`type: 'http'`). */
+export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig;
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */
@@ -69,11 +80,18 @@ export interface AgentQuery {
   abort(): void;
 }
 
+import type { ProgressEvent } from '../progress-events.js';
+
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
   | { type: 'result'; text: string | null }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
-  | { type: 'progress'; message: string }
+  /**
+   * Structured progress event for live UI updates (e.g. Discord embed).
+   * See docs/progress-lane.md and progress-events.ts for the schema.
+   * Channels that don't render progress silently drop these.
+   */
+  | { type: 'progress'; event: ProgressEvent }
   /**
    * Liveness signal. Providers MUST yield this on every underlying SDK
    * event (tool call, thinking, partial message, anything) so the

@@ -137,6 +137,20 @@ export interface ChannelAdapter {
   syncConversations?(): Promise<ConversationInfo[]>;
 
   /**
+   * Render a structured progress event for the agent's current turn (e.g.
+   * Discord live "thinking" embed). Adapters that don't implement this
+   * silently drop progress events at the host delivery layer, keeping
+   * channels like Slack/Telegram working unchanged. See
+   * docs/progress-lane.md.
+   */
+  progress?(
+    hostSessionId: string,
+    platformId: string,
+    threadId: string | null,
+    event: import('./progress-events.js').ProgressEvent,
+  ): Promise<void>;
+
+  /**
    * Subscribe the bot to a thread so follow-up messages route via the
    * platform's "subscribed message" path (onSubscribedMessage in Chat SDK).
    * Called by the router when a mention-sticky wiring first engages in a

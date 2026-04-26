@@ -19,7 +19,6 @@ import { DATA_DIR } from './config.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import {
   createSession,
-  findSession,
   findSessionByAgentGroup,
   findSessionForAgent,
   getSession,
@@ -380,6 +379,32 @@ export function clearOutbox(agentGroupId: string, sessionId: string, messageId: 
   } catch (err) {
     log.warn('Outbox cleanup failed (message already delivered)', { messageId, err });
   }
+}
+
+/**
+ * Write a `cancel` row into the session's inbound.db. The container's
+ * mid-query poll picks this up and calls `query.abort()`, which causes the
+ * provider to yield a final `progress: end, success: false, reason: 'cancelled'`
+ * event so the Discord embed can render 🚫 Cancelled.
+ *
+ * trigger=0 because a cancel should never wake an idle container — if no
+ * query is running there's nothing to abort. Stale cancel rows are cleared
+ * by the container at startup (see clearStalePendingCancels in poll-loop.ts).
+ */
+export function cancelSession(sessionId: string, source = 'unknown'): void {
+  const session = getSession(sessionId);
+  if (!session) {
+    log.warn('cancelSession: session not found', { sessionId });
+    return;
+  }
+  writeSessionMessage(session.agent_group_id, sessionId, {
+    id: `cancel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'cancel',
+    timestamp: new Date().toISOString(),
+    content: JSON.stringify({ source }),
+    trigger: 0,
+  });
+  log.info('Cancel signal written', { sessionId, source });
 }
 
 /** Mark a container as running for a session. */

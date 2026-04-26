@@ -43,6 +43,24 @@ export interface ReplyContext {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
 
+/** Normalized reaction info passed to channel-specific handlers. */
+export interface ReactionInfo {
+  /** Platform message id the reaction was applied to. */
+  messageId: string;
+  /** Platform thread id (channel id encoded by the adapter). */
+  threadId: string;
+  /** Raw platform-specific emoji string (e.g. "❌" for unicode, "<:name:id>" for custom). */
+  rawEmoji: string;
+  /** True when reaction was added; false when removed. */
+  added: boolean;
+  /** Platform user id that reacted, plus a flag indicating whether it was the bot itself. */
+  userId: string;
+  /** True when the reactor is this bot. Bridges always pre-filter; included so handlers can double-check. */
+  isMe: boolean;
+}
+
+export type ReactionHandler = (event: ReactionInfo) => void | Promise<void>;
+
 export interface ChatSdkBridgeConfig {
   adapter: Adapter;
   concurrency?: ConcurrencyStrategy;
@@ -72,6 +90,22 @@ export interface ChatSdkBridgeConfig {
    * and reactions still target the head of the reply.
    */
   maxTextLength?: number;
+  /**
+   * Maximum per-file size the platform accepts (bytes). Files larger than
+   * this are dropped from the outbound delivery and replaced with a per-file
+   * text note appended to the message. Set per-channel because limits differ:
+   * Discord 10 MiB free / 25-100 MiB boosted, Telegram 50 MiB, Slack varies
+   * by workspace plan. Unset = no enforcement (delegate to platform).
+   */
+  maxFileSize?: number;
+  /**
+   * Optional reaction handler. Wired via `chat.onReaction(...)` so the bridge
+   * receives normalized reaction events from any Chat SDK adapter that
+   * supports them (Discord today). Reactions from the bot itself are
+   * pre-filtered. Channels use this to implement reaction-driven UX (e.g.
+   * Discord's ❌-reaction-to-cancel).
+   */
+  onReaction?: ReactionHandler;
 }
 
 /**
@@ -263,6 +297,29 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
       });
 
+      // Reaction events (Discord ❌-cancel etc.). The bridge filters out the
+      // bot's own reactions so handlers don't need to. Errors are logged
+      // and swallowed — a buggy reaction handler must not take down the
+      // gateway listener.
+      if (config.onReaction) {
+        const handler = config.onReaction;
+        chat.onReaction(async (event) => {
+          if (event.user.isMe) return;
+          try {
+            await handler({
+              messageId: event.messageId,
+              threadId: event.threadId,
+              rawEmoji: event.rawEmoji,
+              added: event.added,
+              userId: event.user.userId,
+              isMe: event.user.isMe,
+            });
+          } catch (err) {
+            log.warn('Reaction handler threw', { adapter: adapter.name, err: String(err) });
+          }
+        });
+      }
+
       // Handle button clicks (ask_user_question)
       chat.onAction(async (event) => {
         if (!event.actionId.startsWith('ncq:')) return;
@@ -399,15 +456,36 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         return result?.id;
       }
 
-      // Normal message
+      // Normal message — combine text + optional files.
       const rawText = (content.markdown as string) || (content.text as string);
-      const text = rawText ? transformText(rawText) : rawText;
+      let text = rawText ? transformText(rawText) : rawText;
+
+      // Partition files by size: accepted go to the platform, rejected become
+      // a markdown note appended to the message so the user knows what was
+      // dropped instead of silently losing the file.
+      let fileUploads: Array<{ data: Buffer; filename: string }> | undefined;
+      if (message.files && message.files.length > 0) {
+        const accepted: Array<{ data: Buffer; filename: string }> = [];
+        const rejected: Array<{ filename: string; size: number }> = [];
+        for (const f of message.files) {
+          if (config.maxFileSize !== undefined && f.data.length > config.maxFileSize) {
+            rejected.push({ filename: f.filename, size: f.data.length });
+          } else {
+            accepted.push({ data: f.data, filename: f.filename });
+          }
+        }
+        fileUploads = accepted.length > 0 ? accepted : undefined;
+        if (rejected.length > 0) {
+          const limitMiB = Math.round((config.maxFileSize as number) / (1024 * 1024));
+          const notes = rejected.map(
+            (r) =>
+              `_(file dropped: ${r.filename} is ${(r.size / (1024 * 1024)).toFixed(1)} MiB, over ${limitMiB} MiB limit)_`,
+          );
+          text = text ? `${text}\n\n${notes.join('\n')}` : notes.join('\n');
+        }
+      }
+
       if (text) {
-        // Attach files if present (FileUpload format: { data, filename })
-        const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({
-          data: f.data,
-          filename: f.filename,
-        }));
         // Split if over the adapter's max length. Files ride on the first
         // chunk so the head of the reply still carries them.
         const chunks =
@@ -425,12 +503,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           if (i === 0) firstId = result?.id;
         }
         return firstId;
-      } else if (message.files && message.files.length > 0) {
-        // Files only, no text
-        const fileUploads = message.files.map((f: { data: Buffer; filename: string }) => ({
-          data: f.data,
-          filename: f.filename,
-        }));
+      } else if (fileUploads && fileUploads.length > 0) {
+        // Files-only delivery (no text and nothing was rejected).
         const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
         return result?.id;
       }
